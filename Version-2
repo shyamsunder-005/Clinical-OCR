@@ -1,0 +1,3174 @@
+# %% [markdown]
+# # 🏥 Clinical MoE OCR Pipeline v2.0 — Kaggle T4×2 Edition
+#
+# **Production-grade Mixture-of-Experts OCR pipeline** for clinical document
+# text extraction. Implements a 6-stage pipeline grounded in a 32-paper
+# research corpus [P1]–[P32].
+#
+# ## Pipeline Architecture
+# ```
+# INPUT (PDF/Image)
+#   → Stage 0: Pre-processing + Quality Scoring  [P1][P3][P4][P5]
+#   → Stage 1: Layout Detection + Region Segmentation  [P6][P7][P15]
+#   → Stage 2: Per-Region Quality + Routing Vector  [P1][P2]
+#   → Stage 3: MoE Router (Rule-based Dynamic Routing)  [P26][P27]
+#   → Stage 4: Expert Pool Execution  [P8]–[P14][P17]
+#   → Stage 5: Post-OCR Correction + Provenance  [P23][P24]
+# OUTPUT: Clean UTF-8 text + JSON provenance manifest
+# ```
+#
+# ## Expert Pool (Dual T4 Assignment)
+# | Expert | Model | Role | Device |
+# |--------|-------|------|--------|
+# | **A** | TrOCR-large [P8] | Handwriting (primary) | cuda:0 |
+# | **A-Lite** | CRNN-CTC [P22] | Handwriting (fast) | stub |
+# | **B** | PaddleOCR PP-OCRv4 [P9] | Printed text (default) | CPU |
+# | **C** | DocTR [P10] | Structured form fallback | CPU |
+# | **D** | GOT-OCR 2.0 [P11] | Complex / mixed content | cuda:1 |
+# | **E** | Qwen2-VL-2B [P13] | Premium fallback | cuda:1 |
+# | **F** | MIRAGE [P14] | Indian mixed-script | stub |
+# | **G** | Donut [P17] | OCR-free templated forms | cuda:0 |
+#
+# ## Hardware: Kaggle T4×2 (2× 16 GB = 32 GB total VRAM)
+# All experts **co-resident** — zero load/evict overhead.
+
+# %% [markdown]
+# ## 1 · Install Dependencies
+
+# %%
+import subprocess, sys, os
+
+def _run(cmd, **kw):
+    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if r.returncode != 0:
+        print(f"⚠ {' '.join(cmd[:4])}... failed: {r.stderr[:200]}")
+    return r.returncode == 0
+
+# ── System packages ──────────────────────────────────────────────────
+_run(["apt-get", "update", "-qq"])
+_run(["apt-get", "install", "-y", "-qq",
+      "tesseract-ocr", "tesseract-ocr-eng", "tesseract-ocr-hin",
+      "poppler-utils", "libgl1-mesa-glx"])
+print("✓ System packages installed")
+
+# ── Core Python packages ────────────────────────────────────────────
+_run([sys.executable, "-m", "pip", "install", "-q",
+      "transformers>=4.45.0", "accelerate>=0.34.0",
+      "huggingface_hub>=0.23.0", "bitsandbytes>=0.43.0",
+      "ultralytics>=8.2.0", "opencv-python-headless>=4.9.0",
+      "Pillow>=10.3.0", "pdf2image>=1.17.0", "pytesseract>=0.3.10",
+      "pydantic>=2.7.0", "editdistance", "tiktoken"])
+print("✓ Core Python packages installed")
+
+# FIX-1: CUDA-aware PaddleOCR install — paddlepaddle (CPU) vs paddlepaddle-gpu
+# ── Optional expert packages (graceful failure) ─────────────────────
+try:
+    import torch as _torch_check
+    _has_cuda = _torch_check.cuda.is_available()
+except Exception:
+    _has_cuda = False
+
+if _has_cuda:
+    _paddle_pkg = "paddlepaddle-gpu"
+    print("  GPU detected → installing paddlepaddle-gpu")
+else:
+    _paddle_pkg = "paddlepaddle"
+    print("  No GPU → installing paddlepaddle (CPU)")
+
+HAS_PADDLE = _run([sys.executable, "-m", "pip", "install", "-q",
+                    _paddle_pkg, "paddleocr>=2.7.0"])
+print(f"{'✓' if HAS_PADDLE else '⚠'} PaddleOCR: {_paddle_pkg} {'installed' if HAS_PADDLE else 'unavailable — Tesseract fallback'}")
+
+HAS_DOCTR = _run([sys.executable, "-m", "pip", "install", "-q",
+                   "python-doctr[torch]"])
+print(f"{'✓' if HAS_DOCTR else '⚠'} DocTR: {'installed' if HAS_DOCTR else 'unavailable — Tesseract fallback'}")
+
+print("\n✓ All dependencies processed")
+
+# %% [markdown]
+# ## 2 · Hardware Detection & Configuration
+
+# %%
+import torch
+import logging
+import numpy as np
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)-26s | %(levelname)-5s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("moe_pipeline")
+
+# ── GPU Detection ────────────────────────────────────────────────────
+NUM_GPUS = torch.cuda.device_count()
+if NUM_GPUS > 0:
+    GPU_INFO = [(torch.cuda.get_device_name(i),
+                 round(torch.cuda.mem_get_info(i)[1] / 1024**3, 1))
+                for i in range(NUM_GPUS)]
+    TOTAL_VRAM_GB = sum(g[1] for g in GPU_INFO)
+else:
+    GPU_INFO = []
+    TOTAL_VRAM_GB = 0
+
+# ── Device Assignment (Dual T4 strategy) ─────────────────────────────
+DEVICE_LAYOUT = "cuda:0" if NUM_GPUS > 0 else "cpu"
+DEVICE_LIGHT  = "cuda:0" if NUM_GPUS > 0 else "cpu"
+DEVICE_HEAVY  = f"cuda:{min(1, NUM_GPUS - 1)}" if NUM_GPUS > 0 else "cpu"
+
+print(f"{'═' * 60}")
+print(f"  GPUs detected   : {NUM_GPUS}")
+for i, (name, vram) in enumerate(GPU_INFO):
+    print(f"  GPU {i}            : {name} ({vram} GB)")
+print(f"  Total VRAM       : {TOTAL_VRAM_GB} GB")
+print(f"  Layout device    : {DEVICE_LAYOUT}")
+print(f"  Light experts    : {DEVICE_LIGHT}  (TrOCR, Donut)")
+print(f"  Heavy experts    : {DEVICE_HEAVY}  (GOT-OCR, Qwen2-VL)")
+print(f"  CPU experts      : PaddleOCR, DocTR")
+co_resident = TOTAL_VRAM_GB >= 20
+print(f"  Co-resident mode : {'YES ✓' if co_resident else 'NO — load/evict'}")
+print(f"{'═' * 60}")
+
+
+# ── Pipeline Configuration ───────────────────────────────────────────
+from dataclasses import dataclass, field
+# FIX 1: Added missing imports — Any was missing from typing imports used in
+# PipelineConfig.CONFIDENCE_ESCALATION and throughout the module.
+from typing import Optional, Dict, List, Any
+
+@dataclass
+class PipelineConfig:
+    """All pipeline tunables — paper references in comments."""
+
+    # Hardware
+    DEVICE_LAYOUT: str = DEVICE_LAYOUT
+    DEVICE_LIGHT: str = DEVICE_LIGHT
+    DEVICE_HEAVY: str = DEVICE_HEAVY
+    CO_RESIDENT: bool = co_resident
+
+    # DLA Model [P7]
+    DLA_MODEL_REPO: str = "juliozhao/DocLayout-YOLO-DocStructBench"
+    DLA_MODEL_FILE: str = "doclayout_yolo_docstructbench_imgsz1024.pt"
+    DLA_LOCAL_DIR: str = "/kaggle/working/models"
+
+    # Expert models
+    TROCR_MODEL: str = "microsoft/trocr-large-handwritten"
+    QWEN_VL_MODEL: str = "Qwen/Qwen2-VL-2B-Instruct"
+    GOT_OCR_MODEL: str = "ucaslcl/GOT-OCR2_0"
+    # FIX-8 + FIX-NEW-7: Reverted to cord-v2 (auto-detected task token handles it)
+    DONUT_MODEL: str = "naver-clova-ix/donut-base-finetuned-cord-v2"
+
+    # Quality thresholds [P1]
+    QUALITY_HIGH: float = 500.0
+    QUALITY_MEDIUM: float = 150.0
+
+    # FIX 2: CONFIDENCE_ESCALATION type annotation corrected from
+    # Dict[str, float] to the actual runtime type so field() works correctly.
+    CONFIDENCE_ESCALATION: Dict[str, float] = field(default_factory=lambda: {
+        "PRINTED_TEXT": 0.40,
+        "HANDWRITING": 0.60,
+        "TABLE": 0.50,
+        "TABLE_FORM": 0.50,
+        "FORM_FIELD": 0.50,
+    })
+    CONFIDENCE_ESCALATION_DEFAULT: float = 0.60
+
+    GRID_LINE_THRESHOLD: int = 6
+    FULL_PAGE_AREA_THRESHOLD: float = 0.60
+
+    # Router [P27]
+    ROUTING_TAU: float = 0.85
+
+    def get_escalation_threshold(self, doc_class: str) -> float:
+        env_val = os.environ.get(f"MOE_ESCALATION_{doc_class.upper()}")
+        if env_val is not None:
+            try:
+                return float(env_val)
+            except ValueError:
+                pass
+        # FIX 3: Original guard `if isinstance(self.CONFIDENCE_ESCALATION, float)`
+        # was always False (it's a dict), causing the dict .get() to always be
+        # skipped. Replaced with a proper isinstance(dict) check.
+        if isinstance(self.CONFIDENCE_ESCALATION, dict):
+            return self.CONFIDENCE_ESCALATION.get(doc_class, self.CONFIDENCE_ESCALATION_DEFAULT)
+        return self.CONFIDENCE_ESCALATION_DEFAULT
+
+    # Preprocessing [P3]
+    DPI: int = 300
+    MAX_IMAGE_DIM: int = 2048
+    SAUVOLA_WINDOW: int = 25
+    SAUVOLA_K: float = 0.2
+    # FIX-NEW-10: Raised from 0.5 to reduce false positives on printed forms
+    HANDWRITING_THRESHOLD: float = 0.58
+
+    # DLA [P7]
+    DLA_CONFIDENCE: float = 0.25
+
+    # Tesseract fallback
+    TESSERACT_CONFIG: str = "--oem 3 --psm 6"
+
+config = PipelineConfig()
+print(f"✓ Config initialised")
+
+# %% [markdown]
+# ## 3 · Schemas — Full Provenance Data Models
+
+# %%
+import uuid
+from enum import Enum
+from pydantic import BaseModel, Field as PydField
+
+# ── Enums ────────────────────────────────────────────────────────────
+
+class QualityTier(str, Enum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+class RegionClass(str, Enum):
+    PRINTED_TEXT = "PRINTED_TEXT"
+    HANDWRITING = "HANDWRITING"
+    TABLE = "TABLE"
+    FIGURE = "FIGURE"
+    STAMP = "STAMP"
+    SIGNATURE = "SIGNATURE"
+    FORM_FIELD = "FORM_FIELD"
+    VISUAL_ELEMENT = "VISUAL_ELEMENT"
+
+class SemanticRole(str, Enum):
+    HEADER = "HEADER"
+    PARAGRAPH = "PARAGRAPH"
+    TABLE_CELL = "TABLE_CELL"
+    HANDWRITTEN_NOTE = "HANDWRITTEN_NOTE"
+    PRINTED_FIELD = "PRINTED_FIELD"
+    STAMP_REGION = "STAMP_REGION"
+    FIGURE_CAPTION = "FIGURE_CAPTION"
+
+class ExpertID(str, Enum):
+    A = "A"
+    A_LITE = "A_LITE"
+    B = "B"
+    C = "C"
+    D = "D"
+    E = "E"
+    F = "F"
+    G = "G"
+    TESSERACT = "TESSERACT"
+
+# ── Value Objects ────────────────────────────────────────────────────
+
+class BoundingBox(BaseModel):
+    x: int = PydField(..., description="Left edge (px)")
+    y: int = PydField(..., description="Top edge (px)")
+    w: int = PydField(..., description="Width (px)")
+    h: int = PydField(..., description="Height (px)")
+
+    @property
+    def x_min(self) -> int: return self.x
+    @property
+    def y_min(self) -> int: return self.y
+    @property
+    def x_max(self) -> int: return self.x + self.w
+    @property
+    def y_max(self) -> int: return self.y + self.h
+
+class RoutingVector(BaseModel):
+    laplacian_variance: float = 0.0
+    blur_score: float = 0.0
+    noise_estimate: float = 0.0
+    predicted_cer: float = 1.0
+    region_class: RegionClass = RegionClass.PRINTED_TEXT
+    quality_tier: QualityTier = QualityTier.MEDIUM
+    handwriting_score: float = 0.0
+    script_flag: bool = False
+    complexity_score: float = 0.0
+    probe_confidence: float = 0.0
+    # FIX 4: probe_text was referenced in route_region() via rv.probe_text but
+    # was never declared as a field on RoutingVector, causing AttributeError at
+    # runtime whenever the YES/NO checkbox routing branch was reached.
+    probe_text: str = ""
+    # FIX-NEW-1: Crop area in pixels for area-based routing decisions
+    crop_area_px: int = 0
+
+class RoutingDecision(BaseModel):
+    expert_ids: List[ExpertID]
+    rationale: str
+    probabilities: Dict[str, float] = PydField(default_factory=dict)
+    metadata: Dict[str, Any] = PydField(default_factory=dict)  # FIX-NEW-13: VLM router JSON
+
+# ── Expert Output ────────────────────────────────────────────────────
+
+class WordToken(BaseModel):
+    word: str
+    bbox: Optional[BoundingBox] = None
+    confidence: float = 0.0
+    expert_id: ExpertID = ExpertID.B
+    corrected: bool = False
+    error_probability: float = 0.0
+
+class ExpertOutput(BaseModel):
+    raw_text: str = ""
+    word_tokens: List[WordToken] = PydField(default_factory=list)
+    char_confidence_mean: float = 0.0
+    word_confidence_mean: float = 0.0
+    expert_id: ExpertID = ExpertID.B
+    inference_time_ms: float = 0.0
+
+# ── Region Result ────────────────────────────────────────────────────
+
+class RegionResult(BaseModel):
+    region_id: str = PydField(default_factory=lambda: uuid.uuid4().hex[:8])
+    region_class: RegionClass
+    semantic_role: SemanticRole = SemanticRole.PARAGRAPH
+    detection_confidence: float = 0.0
+    bbox: BoundingBox
+    text: str = ""
+    word_tokens: List[WordToken] = PydField(default_factory=list)
+    expert_id: ExpertID = ExpertID.B
+    routing_vector: Optional[RoutingVector] = None
+    routing_decision: Optional[RoutingDecision] = None
+    inference_time_ms: float = 0.0
+    metadata: Dict[str, Any] = PydField(default_factory=dict)
+
+# ── Routing Log ──────────────────────────────────────────────────────
+
+class RoutingLogEntry(BaseModel):
+    region_id: str
+    routing_vector: RoutingVector
+    experts_invoked: List[ExpertID]
+    fusion_method: str = "single"
+    total_time_ms: float = 0.0
+    router_type: str = "rule_based"      # FIX-NEW-13: "rule_based" or "vlm"
+    crop_area_px: int = 0                 # FIX-NEW-13: for ablation analysis
+
+# ── Page & Document ──────────────────────────────────────────────────
+
+class QualityReport(BaseModel):
+    page_quality_tier: QualityTier = QualityTier.MEDIUM
+    page_laplacian_variance: float = 0.0
+    pct_handwritten: float = 0.0
+    pct_printed: float = 0.0
+    pct_low_confidence: float = 0.0
+    total_regions: int = 0
+
+class PageExtractionResult(BaseModel):
+    page_number: int
+    width: int
+    height: int
+    page_text: str = ""
+    word_tokens: List[WordToken] = PydField(default_factory=list)
+    region_map: List[RegionResult] = PydField(default_factory=list)
+    routing_log: List[RoutingLogEntry] = PydField(default_factory=list)
+    quality_report: Optional[QualityReport] = None
+
+class DocumentExtractionResult(BaseModel):
+    document_id: str = PydField(default_factory=lambda: uuid.uuid4().hex)
+    source_doc_id: str = ""
+    filename: str = ""
+    total_pages: int = 0
+    pages: List[PageExtractionResult] = PydField(default_factory=list)
+    processing_time_seconds: float = 0.0
+
+print("✓ Schemas defined (14 models with full provenance)")
+
+# %% [markdown]
+# ## 4 · Stage 0 — Pre-processing & Quality Scoring [P1][P3][P4][P5]
+
+# %%
+import cv2
+from pathlib import Path
+from pdf2image import convert_from_path
+
+# ── Ingestion ────────────────────────────────────────────────────────
+
+def ingest_document(file_path: str) -> List[np.ndarray]:
+    suffix = Path(file_path).suffix.lower()
+    if suffix == ".pdf":
+        logger.info("Rasterising PDF at %d DPI", config.DPI)
+        pil_imgs = convert_from_path(file_path, dpi=config.DPI)
+        return [cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR) for img in pil_imgs]
+    if suffix in {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}:
+        img = cv2.imread(file_path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError(f"Failed to read image: {file_path}")
+        return [img]
+    raise ValueError(f"Unsupported format: {suffix}")
+
+
+# ── Resize ───────────────────────────────────────────────────────────
+
+def resize_preserving_aspect(image: np.ndarray,
+                              max_dim: int = config.MAX_IMAGE_DIM) -> np.ndarray:
+    h, w = image.shape[:2]
+    if max(h, w) <= max_dim:
+        return image
+    scale = max_dim / max(h, w)
+    return cv2.resize(image, (int(w * scale), int(h * scale)),
+                      interpolation=cv2.INTER_AREA)
+
+
+# ── Binarization [P3] ───────────────────────────────────────────────
+
+def binarize_otsu(gray: np.ndarray) -> np.ndarray:
+    _, binary = cv2.threshold(gray, 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
+def binarize_sauvola(gray: np.ndarray, ws: int = config.SAUVOLA_WINDOW,
+                      k: float = config.SAUVOLA_K) -> np.ndarray:
+    gray_f = gray.astype(np.float64)
+    mean = cv2.boxFilter(gray_f, -1, (ws, ws), normalize=True)
+    # FIX-14: Numerically stable local variance — subtract mean before squaring
+    # to avoid catastrophic cancellation when gray_f values are large.
+    diff = gray_f - mean
+    sq_mean = cv2.boxFilter(diff ** 2, -1, (ws, ws), normalize=True)
+    std = np.sqrt(np.maximum(sq_mean, 0.0))
+    threshold = mean * (1.0 + k * (std / 128.0 - 1.0))
+    binary = np.zeros_like(gray)
+    binary[gray >= threshold] = 255
+    return binary
+
+def auto_binarize(gray: np.ndarray) -> np.ndarray:
+    h, w = gray.shape
+    tile = min(h, w, 64)
+    if tile < 16:
+        return binarize_otsu(gray)
+    means = []
+    for y in range(0, h - tile + 1, tile):
+        for x in range(0, w - tile + 1, tile):
+            means.append(float(np.mean(gray[y:y+tile, x:x+tile])))
+    if float(np.var(means)) > 500.0:
+        return binarize_sauvola(gray)
+    return binarize_otsu(gray)
+
+
+# ── Deskew [P3] ─────────────────────────────────────────────────────
+
+def deskew(image: np.ndarray) -> np.ndarray:
+    coords = np.column_stack(np.where(image < 128))
+    if len(coords) < 100:
+        return image
+    angle = cv2.minAreaRect(coords)[-1]
+    angle = -(90 + angle) if angle < -45 else -angle
+    if abs(angle) < 0.5 or abs(angle) > 15:
+        return image
+    h, w = image.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+# ── CLAHE Enhancement [P3] ──────────────────────────────────────────
+
+def enhance_clahe(crop: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop.copy()
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
+# ── Laplacian Quality Scorer [P1] ───────────────────────────────────
+
+def compute_laplacian_quality(image: np.ndarray) -> tuple:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    variance = float(lap.var())
+    if variance >= config.QUALITY_HIGH:
+        return variance, QualityTier.HIGH
+    elif variance >= config.QUALITY_MEDIUM:
+        return variance, QualityTier.MEDIUM
+    else:
+        return variance, QualityTier.LOW
+
+def compute_blur_score(gray: np.ndarray) -> float:
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(np.mean(np.abs(lap)))
+
+def estimate_noise(gray: np.ndarray) -> float:
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    residual = gray.astype(np.float64) - blur.astype(np.float64)
+    return float(np.std(residual))
+
+
+# FIX-5: Replaced Tesseract OSD with lightweight projection-profile orientation
+# estimator. 10× faster and more reliable on small crops. For 90° rotated crops
+# (common for patient ID stickers), tries both directions and probes each.
+def detect_and_correct_rotation(crop: np.ndarray) -> tuple:
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+    h, w = gray.shape[:2]
+    if h < 20 or w < 20:
+        return crop, 0
+
+    # Compute horizontal vs vertical projection energy
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    h_proj = np.sum(binary, axis=1).astype(float)
+    v_proj = np.sum(binary, axis=0).astype(float)
+
+    h_energy = float(np.var(h_proj)) if len(h_proj) > 1 else 0.0
+    v_energy = float(np.var(v_proj)) if len(v_proj) > 1 else 0.0
+
+    # Normal text: high horizontal energy (text lines create peaks in row projection)
+    # 90° rotated text: high vertical energy
+    if v_energy > h_energy * 2.0 and v_energy > 1000:
+        # Likely 90° rotated — try both directions, pick best via fast OCR probe
+        import pytesseract
+        cw  = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
+        ccw = cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        def _quick_probe(img):
+            try:
+                data = pytesseract.image_to_data(
+                    img, config="--oem 3 --psm 6",
+                    output_type=pytesseract.Output.DICT)
+                chars = sum(len(w) for w, c in zip(data["text"], data["conf"])
+                            if w.strip() and int(c) > 0)
+                conf  = np.mean([int(c)/100.0 for c in data["conf"]
+                                 if int(c) > 0]) if any(int(c) > 0 for c in data["conf"]) else 0.0
+                return chars * conf
+            except Exception:
+                return 0.0
+
+        score_cw  = _quick_probe(cw)
+        score_ccw = _quick_probe(ccw)
+
+        if score_cw >= score_ccw and score_cw > 0:
+            logger.info("    ↳ Rotation corrected: 90° CW (projection-profile)")
+            return cw, 90
+        elif score_ccw > 0:
+            logger.info("    ↳ Rotation corrected: 270° CW (projection-profile)")
+            return ccw, 270
+
+    # Check for 180° rotation: text exists but ascenders/descenders are inverted
+    # This is rare and hard to detect reliably; skip unless energy is very low
+    return crop, 0
+
+# ── Full Stage 0 Pipeline ───────────────────────────────────────────
+
+def preprocess_page(image: np.ndarray) -> tuple:
+    resized = resize_preserving_aspect(image)
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY) if len(resized.shape) == 3 else resized
+    binary = auto_binarize(gray)
+    binary = deskew(binary)
+    variance, tier = compute_laplacian_quality(image)
+    logger.info("Stage 0: page quality = %.1f (%s)", variance, tier.value)
+    return binary, variance, tier
+
+print("✓ Stage 0 — Pre-processing ready")
+
+# %% [markdown]
+# ## 5 · Stage 1 — Layout Detection & Region Segmentation [P7]
+
+# %%
+
+# ── DocLayout-YOLO Class Mapping [P7] ───────────────────────────────
+
+DOCLAYNET_CLASS_MAP: dict = {
+    0: RegionClass.PRINTED_TEXT,
+    1: RegionClass.PRINTED_TEXT,
+    2: RegionClass.PRINTED_TEXT,
+    3: RegionClass.PRINTED_TEXT,
+    4: RegionClass.PRINTED_TEXT,
+    5: RegionClass.PRINTED_TEXT,
+    6: RegionClass.VISUAL_ELEMENT,
+    7: RegionClass.PRINTED_TEXT,
+    8: RegionClass.TABLE,
+    9: RegionClass.PRINTED_TEXT,
+    10: RegionClass.PRINTED_TEXT,
+}
+
+# ── Table Structure Detection ─────────────────────────────────────────
+
+def has_table_structure(page_image: np.ndarray) -> bool:
+    gray = cv2.cvtColor(page_image, cv2.COLOR_BGR2GRAY) if len(page_image.shape) == 3 else page_image
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    # FIX-4: Lowered HoughLinesP parameters for clinical form line detection.
+    # threshold=100 (was 200) — clinical forms have thinner lines
+    # minLineLength=shape[1]//6 (was //3) — catch shorter internal cell lines
+    # maxLineGap=20 (was 10) — allow small gaps in dashed/partial lines
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180, threshold=100,
+        minLineLength=page_image.shape[1] // 6, maxLineGap=20,
+    )
+    if lines is None:
+        return False
+    horizontal = sum(1 for l in lines for x1, y1, x2, y2 in [l[0]] if abs(y1 - y2) < 5)
+    vertical   = sum(1 for l in lines for x1, y1, x2, y2 in [l[0]] if abs(x1 - x2) < 5)
+    # FIX-4: Require at least 3 horizontal AND 1 vertical (or vice versa)
+    return (horizontal >= 3 and vertical >= 1) or (vertical >= 3 and horizontal >= 1)
+
+def grid_aware_split(page_image: np.ndarray,
+                      parent_region: "RegionResult") -> List["RegionResult"]:
+    gray = cv2.cvtColor(page_image, cv2.COLOR_BGR2GRAY) if len(page_image.shape) == 3 else page_image
+    h, w = gray.shape[:2]
+    parent_bb = parent_region.bbox
+
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    # FIX-4: Same parameter fixes as has_table_structure()
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
+                             minLineLength=w // 6, maxLineGap=20)
+
+    h_lines, v_lines = [], []
+    if lines is not None:
+        for l in lines:
+            x1, y1, x2, y2 = l[0]
+            if abs(y1 - y2) < 5:
+                h_lines.append((y1 + y2) // 2)
+            elif abs(x1 - x2) < 5:
+                v_lines.append((x1 + x2) // 2)
+
+    h_lines = sorted(set(h_lines))
+    h_clustered: List[int] = []
+    for y in h_lines:
+        if not h_clustered or y - h_clustered[-1] > 15:
+            h_clustered.append(y)
+
+    v_lines = sorted(set(v_lines))
+    v_clustered: List[int] = []
+    for x in v_lines:
+        if not v_clustered or x - v_clustered[-1] > 15:
+            v_clustered.append(x)
+
+    row_boundaries = sorted(set([0] + h_clustered + [h]))
+    col_boundaries = sorted(set([0] + v_clustered + [w])) if len(v_clustered) >= 1 else [0, w]
+
+    regions: List[RegionResult] = []
+    min_cell_area = h * w * 0.005
+
+    for r_idx in range(len(row_boundaries) - 1):
+        y1, y2 = row_boundaries[r_idx], row_boundaries[r_idx + 1]
+        if y2 - y1 < 10:
+            continue
+        for c_idx in range(len(col_boundaries) - 1):
+            x1, x2 = col_boundaries[c_idx], col_boundaries[c_idx + 1]
+            if x2 - x1 < 10:
+                continue
+            if (x2 - x1) * (y2 - y1) < min_cell_area:
+                continue
+
+            cell_crop = gray[y1:y2, x1:x2]
+            ink = float(np.sum(cell_crop < 200)) / max(cell_crop.size, 1)
+            if ink < 0.01:
+                continue
+
+            regions.append(RegionResult(
+                region_class=parent_region.region_class,
+                detection_confidence=parent_region.detection_confidence * 0.9,
+                bbox=BoundingBox(
+                    x=parent_bb.x + x1, y=parent_bb.y + y1,
+                    w=x2 - x1, h=y2 - y1,
+                ),
+                metadata={"detection_method": "grid_aware_split"},
+            ))
+
+    return regions if regions else [parent_region]
+
+
+def split_two_column_form(page_image: np.ndarray,
+                           parent_region: RegionResult) -> List[RegionResult]:
+    """
+    FIX-NEW-3: Detect the central vertical divider in a two-column clinical form
+    and split into left (progress notes) and right (orders) sub-regions.
+    Returns [left, right] or [parent_region] if no divider found.
+    """
+    gray = cv2.cvtColor(page_image, cv2.COLOR_BGR2GRAY) if len(page_image.shape) == 3 else page_image
+    h, w = gray.shape[:2]
+    parent_bb = parent_region.bbox
+
+    centre_x_start = w // 3
+    centre_x_end = 2 * w // 3
+    centre_strip = gray[:, centre_x_start:centre_x_end]
+
+    edges = cv2.Canny(centre_strip, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=150,
+                             minLineLength=h // 3, maxLineGap=30)
+    if lines is None:
+        return [parent_region]
+
+    v_xs = []
+    for l in lines:
+        x1, y1, x2, y2 = l[0]
+        if abs(x1 - x2) < 8 and abs(y1 - y2) > h // 4:
+            v_xs.append(centre_x_start + (x1 + x2) // 2)
+
+    if not v_xs:
+        return [parent_region]
+
+    divider_x = int(np.median(v_xs))
+    pad = 10
+
+    left_region = RegionResult(
+        region_class=parent_region.region_class,
+        detection_confidence=parent_region.detection_confidence * 0.9,
+        bbox=BoundingBox(x=parent_bb.x, y=parent_bb.y,
+                         w=max(10, divider_x - pad - parent_bb.x), h=parent_bb.h),
+        metadata={"detection_method": "two_column_split_left", "column": "progress_notes"},
+    )
+    right_region = RegionResult(
+        region_class=parent_region.region_class,
+        detection_confidence=parent_region.detection_confidence * 0.9,
+        bbox=BoundingBox(x=divider_x + pad, y=parent_bb.y,
+                         w=max(10, parent_bb.x + parent_bb.w - divider_x - pad), h=parent_bb.h),
+        metadata={"detection_method": "two_column_split_right", "column": "orders"},
+    )
+    logger.info("    ↳ Two-column split at x=%d (left=%dpx, right=%dpx)",
+                divider_x, left_region.bbox.w, right_region.bbox.w)
+    return [left_region, right_region]
+
+
+class LayoutDetector:
+    """
+    Stage 1: DocLayout-YOLO [P7] + handwriting heuristic classifier.
+    Falls back to contour-based detection if YOLO unavailable.
+    """
+
+    def __init__(self):
+        self._model = None
+        self._load_model()
+
+    def _load_model(self):
+        local_dir = Path(config.DLA_LOCAL_DIR)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_path = local_dir / "doclayout_yolo.pt"
+
+        if local_path.is_file():
+            self._init_yolo(str(local_path))
+            return
+
+        try:
+            from huggingface_hub import hf_hub_download
+            logger.info("Downloading DocLayout-YOLO from HuggingFace Hub …")
+            path = hf_hub_download(
+                repo_id=config.DLA_MODEL_REPO,
+                filename=config.DLA_MODEL_FILE,
+                local_dir=str(local_dir),
+            )
+            self._init_yolo(path)
+        except Exception as e:
+            logger.warning("DLA download failed (%s). Using contour fallback.", e)
+
+    def _init_yolo(self, path: str):
+        try:
+            from ultralytics import YOLO
+            self._model = YOLO(path)
+            self._model.to("cpu")
+            logger.info("DocLayout-YOLO loaded: %s", path)
+
+            # Patch DocLayout-YOLO bn attribute bug
+            try:
+                import torch.nn.functional as F
+                import doclayout_yolo.nn.modules.g2l_crm as g2l
+                def patched_dilated_conv(self_m, x, dilation):
+                    weight = self_m.dcv.conv.weight
+                    padding = dilation * (self_m.k // 2)
+                    x = F.conv2d(x, weight, stride=1, padding=padding, dilation=dilation)
+                    if hasattr(self_m.dcv, "bn") and self_m.dcv.bn is not None:
+                        x = self_m.dcv.bn(x)
+                    if hasattr(self_m.dcv, "act") and self_m.dcv.act is not None:
+                        x = self_m.dcv.act(x)
+                    return x
+                for name in dir(g2l):
+                    obj = getattr(g2l, name)
+                    if isinstance(obj, type) and hasattr(obj, "dilated_conv"):
+                        obj.dilated_conv = patched_dilated_conv
+            except Exception:
+                pass
+
+            # Patch Ultralytics postprocess for DocLayout-YOLO dict output
+            try:
+                from ultralytics.models.yolo.detect.predict import DetectionPredictor
+                if not hasattr(DetectionPredictor, "_orig_pp"):
+                    DetectionPredictor._orig_pp = DetectionPredictor.postprocess
+                    def patched_pp(self_p, preds, img, orig_imgs):
+                        if isinstance(preds, dict):
+                            preds = preds.get("one2one", list(preds.values())[0])
+                            if isinstance(preds, (list, tuple)):
+                                preds = preds[0]
+                        return self_p._orig_pp(preds, img, orig_imgs)
+                    DetectionPredictor.postprocess = patched_pp
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.warning("YOLO init failed (%s). Contour fallback.", e)
+            self._model = None
+
+    # ── Detection ────────────────────────────────────────────────────
+
+    def detect(self, original: np.ndarray,
+               preprocessed: np.ndarray) -> List[RegionResult]:
+        if self._model is not None:
+            regions = self._detect_yolo(original)
+        else:
+            regions = self._detect_contours(preprocessed, original)
+
+        page_h, page_w = original.shape[:2]
+        page_area = page_h * page_w
+        if len(regions) == 1:
+            r = regions[0]
+            region_area = r.bbox.w * r.bbox.h
+            if region_area > config.FULL_PAGE_AREA_THRESHOLD * page_area:
+                if has_table_structure(original):
+                    logger.info("    ↳ Full-page region with table structure detected. Splitting...")
+                    regions = grid_aware_split(original, r)
+
+        for region in regions:
+            if region.region_class == RegionClass.PRINTED_TEXT:
+                crop = self._get_crop(original, region.bbox)
+                if crop.size == 0:
+                    continue
+                hw_score = self._classify_handwriting(crop)
+                region.metadata["handwriting_score"] = round(hw_score, 3)
+                if hw_score > config.HANDWRITING_THRESHOLD:
+                    region.region_class = RegionClass.HANDWRITING
+
+        regions = self._sort_reading_order(regions)
+        return regions
+
+    def _detect_yolo(self, image: np.ndarray) -> List[RegionResult]:
+        try:
+            self._model.to(config.DEVICE_LAYOUT)
+            results = self._model(image, conf=config.DLA_CONFIDENCE, verbose=False)
+        finally:
+            if not config.CO_RESIDENT:
+                self._model.to("cpu")
+                torch.cuda.empty_cache()
+
+        regions = []
+        h_img, w_img = image.shape[:2]
+        for result in results:
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                cls = DOCLAYNET_CLASS_MAP.get(cls_id, RegionClass.PRINTED_TEXT)
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+                pad_x = max(15, int(w_img * 0.015))
+                pad_y = max(10, int(h_img * 0.010))
+                x1 = max(0, x1 - pad_x)
+                y1 = max(0, y1 - pad_y)
+                x2 = min(w_img, x2 + pad_x)
+                y2 = min(h_img, y2 + pad_y)
+
+                regions.append(RegionResult(
+                    region_class=cls,
+                    detection_confidence=float(box.conf[0]),
+                    bbox=BoundingBox(x=int(x1), y=int(y1),
+                                     w=int(x2 - x1), h=int(y2 - y1)),
+                    metadata={"detection_method": "doclayout_yolo"},
+                ))
+        return regions if regions else self._whole_page(image)
+
+    def _detect_contours(self, preprocessed: np.ndarray,
+                          original: np.ndarray) -> List[RegionResult]:
+        inverted = cv2.bitwise_not(preprocessed)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 10))
+        dilated = cv2.dilate(inverted, kernel, iterations=2)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        h, w = original.shape[:2]
+        min_area = (h * w) * 0.001
+        pad = 5
+        regions = []
+        for c in contours:
+            x, y, cw, ch = cv2.boundingRect(c)
+            if cw * ch < min_area:
+                continue
+            regions.append(RegionResult(
+                region_class=RegionClass.PRINTED_TEXT,
+                detection_confidence=0.85,
+                bbox=BoundingBox(x=max(0, x - pad), y=max(0, y - pad),
+                                 w=min(cw + 2*pad, w - x), h=min(ch + 2*pad, h - y)),
+                metadata={"detection_method": "contour_fallback"},
+            ))
+        return regions if regions else self._whole_page(original)
+
+    # ── Handwriting Classifier (4-feature heuristic) ─────────────────
+
+    def _classify_handwriting(self, crop: np.ndarray) -> float:
+        # FIX-NEW-10: Reject non-text regions before running the 4-feature classifier
+        if crop.shape[0] * crop.shape[1] < 2000:
+            return 0.0  # too small to classify
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop.copy()
+        _, binary = cv2.threshold(gray, 0, 255,
+                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # FIX-NEW-10: Square/circular low-ink = logo or seal, not handwriting
+        _aspect = max(gray.shape[0], gray.shape[1]) / (min(gray.shape[0], gray.shape[1]) + 1)
+        _ink = float(np.sum(binary > 0)) / binary.size
+        if _aspect < 1.4 and _ink < 0.10:
+            return 0.0
+
+        try:
+            f1 = self._feat_cc_variance(binary)
+            f2 = self._feat_stroke_width(binary)
+            f3 = self._feat_baseline(binary)
+            f4 = self._feat_edge_entropy(gray)
+        except Exception:
+            return 0.0
+        return float(np.clip(0.30*f1 + 0.25*f2 + 0.25*f3 + 0.20*f4, 0, 1))
+
+    @staticmethod
+    def _feat_cc_variance(binary: np.ndarray) -> float:
+        n, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+        if n <= 2:
+            return 0.0
+        areas = stats[1:, cv2.CC_STAT_AREA].astype(float)
+        areas = areas[areas > 20]
+        if len(areas) < 3:
+            return 0.0
+        cv_val = float(np.std(areas) / (np.mean(areas) + 1e-6))
+        return float(1 / (1 + np.exp(-(cv_val - 1.5) / 0.8)))
+
+    @staticmethod
+    def _feat_stroke_width(binary: np.ndarray) -> float:
+        dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        vals = dist[dist > 0]
+        if len(vals) < 10:
+            return 0.0
+        swv = float(np.std(vals) / (np.mean(vals) + 1e-6))
+        return float(1 / (1 + np.exp(-(swv - 0.5) / 0.3)))
+
+    @staticmethod
+    def _feat_baseline(binary: np.ndarray) -> float:
+        proj = np.sum(binary, axis=1).astype(float)
+        if proj.max() < 1:
+            return 0.0
+        ks = max(3, len(proj) // 50)
+        if ks % 2 == 0:
+            ks += 1
+        sm = cv2.GaussianBlur(proj.reshape(-1, 1), (1, ks), 0).flatten()
+        diff = np.diff((sm > sm.max() * 0.2).astype(np.int8))
+        starts = np.where(diff == 1)[0]
+        if len(starts) < 3:
+            return 0.0
+        sp = np.diff(starts).astype(float)
+        cv_sp = float(np.std(sp) / (np.mean(sp) + 1e-6))
+        return float(1 / (1 + np.exp(-(cv_sp - 0.4) / 0.25)))
+
+    @staticmethod
+    def _feat_edge_entropy(gray: np.ndarray) -> float:
+        sx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        mag = np.sqrt(sx**2 + sy**2)
+        angles = np.arctan2(sy, sx)
+        mask = mag > (mag.max() * 0.1)
+        if mask.sum() < 10:
+            return 0.0
+        hist, _ = np.histogram(angles[mask], bins=36, range=(-np.pi, np.pi))
+        hist = hist.astype(float)
+        hist /= hist.sum() + 1e-10
+        entropy = float(-np.sum(hist * np.log2(hist + 1e-10)))
+        norm = entropy / np.log2(36)
+        return float(1 / (1 + np.exp(-(norm - 0.78) / 0.08)))
+
+    # ── Helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_crop(image: np.ndarray, bb: BoundingBox) -> np.ndarray:
+        return image[bb.y_min:bb.y_max, bb.x_min:bb.x_max]
+
+    @staticmethod
+    def _whole_page(image: np.ndarray) -> List[RegionResult]:
+        h, w = image.shape[:2]
+        return [RegionResult(
+            region_class=RegionClass.PRINTED_TEXT,
+            detection_confidence=0.5,
+            bbox=BoundingBox(x=0, y=0, w=w, h=h),
+            metadata={"detection_method": "whole_page_fallback"},
+        )]
+
+    @staticmethod
+    def _sort_reading_order(regions: List[RegionResult],
+                             band_height: int = 50) -> List[RegionResult]:
+        def key(r: RegionResult):
+            cy = (r.bbox.y_min + r.bbox.y_max) / 2
+            cx = (r.bbox.x_min + r.bbox.x_max) / 2
+            return (int(cy / band_height), cx)
+        return sorted(regions, key=key)
+
+
+layout_detector = LayoutDetector()
+print(f"✓ Stage 1 — Layout Detector ready ({'YOLO' if layout_detector._model else 'contour fallback'})")
+
+# %% [markdown]
+# ## 6 · Stage 2 — Per-Region Quality Scoring & Routing Vector [P1][P2]
+
+# %%
+
+def detect_script(text: str) -> bool:
+    if not text:
+        return False
+    non_latin = sum(1 for c in text if ord(c) > 0x024F and not c.isspace())
+    total = sum(1 for c in text if not c.isspace())
+    if total == 0:
+        return False
+    return (non_latin / total) > 0.20
+
+
+def compute_routing_vector(
+    region_crop: np.ndarray,
+    region: RegionResult,
+    page_quality_tier: QualityTier,
+    page_region_classes: List[RegionClass],
+    probe_text: str = "",
+    probe_confidence: float = 0.0,
+) -> RoutingVector:
+    gray = cv2.cvtColor(region_crop, cv2.COLOR_BGR2GRAY) \
+        if len(region_crop.shape) == 3 else region_crop
+
+    lap_var, quality_tier = compute_laplacian_quality(region_crop)
+    blur = compute_blur_score(gray)
+    noise = estimate_noise(gray)
+    script_flag = detect_script(probe_text)
+
+    distinct_classes = len(set(page_region_classes))
+    complexity = min(distinct_classes / 5.0, 1.0)
+
+    predicted_cer = max(0.01, 0.30 - 0.29 * probe_confidence)
+
+    # FIX-NEW-1: Crop area for area-based routing
+    crop_area_px = int(region_crop.shape[0] * region_crop.shape[1])
+
+    return RoutingVector(
+        laplacian_variance=lap_var,
+        blur_score=blur,
+        noise_estimate=noise,
+        predicted_cer=predicted_cer,
+        region_class=region.region_class,
+        quality_tier=quality_tier,
+        handwriting_score=region.metadata.get("handwriting_score", 0.0),
+        script_flag=script_flag,
+        complexity_score=complexity,
+        probe_confidence=probe_confidence,
+        # FIX 5: probe_text was computed and passed around but never stored on
+        # the RoutingVector, so rv.probe_text in route_region() always raised
+        # AttributeError. Now stored alongside the other routing features.
+        probe_text=probe_text,
+        crop_area_px=crop_area_px,  # FIX-NEW-1
+    )
+
+print("✓ Stage 2 — Quality Scoring ready")
+
+# %% [markdown]
+# ## 7 · Stage 3 — MoE Router [P26][P27][P28]
+
+# %%
+
+import re
+import json as _json_module
+CHECKBOX_PATTERN = re.compile(r"YES\s*/?\s*NO", re.IGNORECASE)
+
+def route_region_fast(rv: RoutingVector,
+                      available_experts: set) -> RoutingDecision:
+    """
+    Tier 1: Rule-based MoE router implementing the canonical routing table [P26][P27].
+    Renamed from route_region() for the two-tier hybrid router [FIX-NEW-13].
+    """
+    rc = rv.region_class
+    qt = rv.quality_tier
+
+    def pick(experts: List[ExpertID], rationale: str) -> RoutingDecision:
+        selected = [e for e in experts if e in available_experts]
+        if not selected:
+            for fb in [ExpertID.B, ExpertID.TESSERACT]:
+                if fb in available_experts:
+                    selected = [fb]
+                    break
+            if not selected:
+                selected = [ExpertID.TESSERACT]
+        return RoutingDecision(expert_ids=selected, rationale=rationale)
+
+    # ── Indian script override ───────────────────────────────────────
+    if rv.script_flag:
+        return pick([ExpertID.F, ExpertID.E, ExpertID.B],
+                     "Indian script detected (>20% non-Latin) [P14]")
+
+    # ── Checkbox YES/NO routing ────────────────────────────────────
+    # FIX 6: rv.probe_text was accessed here but the field did not exist on
+    # RoutingVector (see FIX 4/5). With the field now declared and populated
+    # this branch works correctly.
+    if rv.probe_text and CHECKBOX_PATTERN.search(rv.probe_text):
+        return pick([ExpertID.D, ExpertID.B],
+                     "YES/NO checkbox detected in probe → Expert D (GOT-OCR) [P11]")
+
+    # FIX-9: Remove the > 0 guard so zero-confidence regions also escalate.
+    threshold = config.get_escalation_threshold(rc.value)
+    if rv.probe_confidence < threshold:
+        # FIX-9: Handle zero-confidence case specifically
+        if rv.probe_confidence == 0.0:
+            _ink = rv.laplacian_variance  # proxy: low lap_var likely blank
+            if rc == RegionClass.PRINTED_TEXT and qt == QualityTier.HIGH:
+                return pick([ExpertID.D],
+                             "Zero-confidence PRINTED+HIGH → Expert D (GOT-OCR) only [FIX-9]")
+            elif rc == RegionClass.HANDWRITING:
+                return pick([ExpertID.A],
+                             "Zero-confidence HANDWRITING → Expert A (TrOCR) only [FIX-9]")
+            elif qt == QualityTier.LOW:
+                return pick([ExpertID.E],
+                             "Zero-confidence LOW quality → Expert E [FIX-9]")
+            # ink_density < 0.03 check is done upstream in _process_page blank guard
+        return pick([ExpertID.E, ExpertID.D, ExpertID.B],
+                     f"Probe confidence {rv.probe_confidence:.2f} < {threshold:.2f} ({rc.value} threshold) — escalate [P12]")
+
+    # ── Main routing table ───────────────────────────────────────────
+    if rc == RegionClass.TABLE:
+        return pick([ExpertID.D, ExpertID.E, ExpertID.B],
+                     "TABLE region → Expert D (GOT-OCR 2.0) [P11]")
+
+    if rc == RegionClass.FORM_FIELD:
+        return pick([ExpertID.G, ExpertID.B],
+                     "FORM_FIELD → Expert G (Donut) or B [P17]")
+
+    # FIX-NEW-1: Handwriting routing by crop area
+    if rc == RegionClass.HANDWRITING:
+        if rv.crop_area_px > 150_000:
+            # Large → VLM primary (will be caught by two-tier router)
+            return pick([ExpertID.E, ExpertID.D], "HANDWRITING large crop → E+D [FIX-NEW-1]")
+        elif rv.crop_area_px >= 20_000:
+            # Medium → TrOCR primary (its training domain)
+            return pick([ExpertID.A], "HANDWRITING medium crop → A [FIX-NEW-1]")
+        else:
+            # Small → probe result is sufficient
+            return pick([ExpertID.B], "HANDWRITING tiny crop → B probe [FIX-NEW-1]")
+
+    if rc == RegionClass.PRINTED_TEXT:
+        # FIX-6: Lowered B→C routing thresholds. Expert C only for genuinely
+        # low probe confidence, not the 0.70-0.84 range where B is sufficient.
+        if qt == QualityTier.HIGH:
+            experts = [ExpertID.B]
+            if rv.probe_confidence < 0.65:
+                experts.append(ExpertID.C)
+            return pick(experts,
+                         f"PRINTED + HIGH → Expert B (conf={rv.probe_confidence:.2f}) [P9][P10]")
+        elif qt == QualityTier.MEDIUM:
+            experts = [ExpertID.B]
+            if rv.probe_confidence < 0.55:
+                experts.append(ExpertID.C)
+            return pick(experts,
+                         f"PRINTED + MEDIUM → Expert B (conf={rv.probe_confidence:.2f}) [P9][P10]")
+        else:
+            # FIX-6: LOW quality only — Expert E is allowed here
+            return pick([ExpertID.D, ExpertID.E, ExpertID.B],
+                         "PRINTED + LOW → Expert D + E [P11][P13]")
+
+    if rv.complexity_score > 0.6:
+        return pick([ExpertID.D, ExpertID.E, ExpertID.B],
+                     f"MIXED_COMPLEX (complexity={rv.complexity_score:.2f}) → D + E [P11][P13]")
+
+    if rc in (RegionClass.VISUAL_ELEMENT, RegionClass.FIGURE,
+              RegionClass.STAMP, RegionClass.SIGNATURE):
+        return RoutingDecision(
+            expert_ids=[],
+            rationale=f"Visual element ({rc.value}) — skip OCR",
+        )
+
+    return pick([ExpertID.B, ExpertID.TESSERACT],
+                 f"Default route for {rc.value} + {qt.value}")
+
+
+# ── FIX-NEW-13: VLM-Guided Expert Recommendation Router ─────────────
+
+def _pil_from_crop(crop: np.ndarray) -> "Image.Image":
+    """Convert BGR/grayscale numpy crop to RGB PIL Image."""
+    from PIL import Image
+    if len(crop.shape) == 2:
+        return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB))
+    return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+
+
+_ROUTER_EXPERT_MAP = {
+    "TrOCR":     ExpertID.A,
+    "PaddleOCR": ExpertID.B,
+    "DocTR":     ExpertID.C,
+    "GOT":       ExpertID.D,
+    "GOT-OCR":   ExpertID.D,
+    "Qwen":      ExpertID.E,
+    "Qwen2-VL":  ExpertID.E,
+}
+
+_VLM_ROUTER_PROMPT = (
+    "Analyze this image crop from an Indian hospital medical record. "
+    "Determine which OCR system is most likely to transcribe it accurately. "
+    "\n\nRespond ONLY with a JSON object — no preamble, no explanation outside the JSON:\n"
+    '{\n'
+    '  "script": "English",\n'
+    '  "style": "Messy cursive",\n'
+    '  "quality": "Medium",\n'
+    '  "blur": "None",\n'
+    '  "cursiveness": "High",\n'
+    '  "layout": "MultiLine",\n'
+    '  "difficulty": 0.7,\n'
+    '  "recommended": ["Qwen", "GOT"],\n'
+    '  "confidence": 0.85,\n'
+    '  "reason": "Dense cursive handwriting on ruled form"\n'
+    '}\n\n'
+    "Fill in the actual values for this image. "
+    "difficulty and confidence MUST be decimal numbers between 0.0 and 1.0.\n\n"
+    "Expert capabilities:\n"
+    "- TrOCR: best for clean/neat cursive, single-line or short multi-line strips, "
+    "English handwriting, small/medium crops (< 150,000 px²)\n"
+    "- GOT: best for structured tables, mixed print+handwrite, forms with "
+    "grid lines, moderate complexity\n"
+    "- PaddleOCR: best for clean printed text, typed forms, high contrast\n"
+    "- Qwen: best for dense cursive, degraded/low-contrast, two-column layouts, "
+    "large handwriting regions, anything with complex layout or mixed content\n"
+    "\nRecommend 1-2 experts. Order by priority (first = primary)."
+)
+
+
+def _safe_float(val, default: float = 0.5) -> float:
+    """Safely convert a value to float, handling strings like '0.0-1.0'."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        # Try direct conversion first
+        try:
+            return float(val)
+        except ValueError:
+            pass
+        # Try extracting first number from strings like "0.7-0.8" or "0.0-1.0"
+        import re as _re_sf
+        m = _re_sf.search(r'(\d+\.?\d*)', val)
+        if m:
+            return float(m.group(1))
+    return default
+
+
+def _fast_route_is_certain(rv: RoutingVector) -> bool:
+    """FIX-NEW-13: Check if the fast rule-based router can handle this with certainty."""
+    
+    # 1. Always use VLM router for HANDWRITING to properly analyze messiness/density,
+    # EXCEPT for tiny, ultra-high confidence snippets where rule-based is sufficient.
+    if rv.region_class == RegionClass.HANDWRITING:
+        if rv.crop_area_px < 20_000 and rv.probe_confidence > 0.85:
+            return True
+        return False  # Escalate to VLM
+        
+    # 2. For PRINTED_TEXT, the fast rule-based router handles it well, 
+    # EXCEPT for low quality or very low confidence regions.
+    if rv.region_class == RegionClass.PRINTED_TEXT:
+        if rv.quality_tier == QualityTier.LOW:
+            return False
+        if rv.probe_confidence < 0.40:
+            return False
+        return True
+        
+    # 3. For all other classes (TABLE, FIGURE, etc), rule-based has explicit paths
+    return True
+
+
+def route_region_vlm(
+    crop: np.ndarray,
+    rv: RoutingVector,
+    expert_e: "ExpertE_QwenVL",
+    available_experts: set,
+    fallback_fn,
+) -> RoutingDecision:
+    """
+    FIX-NEW-13: VLM-guided Expert Recommendation Router.
+    Qwen2-VL analyzes the image crop and recommends which OCR experts to invoke.
+    Returns a RoutingDecision with the recommended expert IDs and full JSON rationale.
+    Falls back to rule-based router on any failure.
+    """
+    if expert_e._model is None:
+        return fallback_fn(rv, available_experts)
+
+    try:
+        # Downscale large crops to prevent CUDA OOM — router only needs
+        # to see the image, not read every character
+        _rh, _rw = crop.shape[:2]
+        _max_router_edge = 512
+        if max(_rh, _rw) > _max_router_edge:
+            _scale = _max_router_edge / max(_rh, _rw)
+            crop_resized = cv2.resize(crop, (int(_rw * _scale), int(_rh * _scale)),
+                                       interpolation=cv2.INTER_AREA)
+        else:
+            crop_resized = crop
+
+        pil = _pil_from_crop(crop_resized)
+        messages = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": _VLM_ROUTER_PROMPT}
+        ]}]
+        text_prompt = expert_e._processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = expert_e._processor(
+            text=[text_prompt], images=[pil],
+            return_tensors="pt", padding=True,
+        ).to(expert_e._model.device)
+
+        with torch.no_grad():
+            out = expert_e._model.generate(
+                **inputs,
+                max_new_tokens=180,      # short — just JSON
+                do_sample=False,
+            )
+        generated = out[0][inputs["input_ids"].shape[1]:]
+        raw = expert_e._processor.decode(generated, skip_special_tokens=True).strip()
+
+        # Extract JSON — strip any leading/trailing prose
+        import re as _re_r
+        json_match = _re_r.search(r'\{.*\}', raw, _re_r.DOTALL)
+        if not json_match:
+            raise ValueError(f"No JSON found in router output: {raw[:100]}")
+
+        rec = _json_module.loads(json_match.group())
+        recommended_strs = rec.get("recommended", [])
+        router_confidence = _safe_float(rec.get("confidence", 0.5), 0.5)
+        difficulty = _safe_float(rec.get("difficulty", 0.5), 0.5)
+        reason = str(rec.get("reason", "VLM recommendation"))
+
+        expert_ids = []
+        for name in recommended_strs[:2]:          # max 2 experts
+            eid = _ROUTER_EXPERT_MAP.get(name)
+            if eid and eid in available_experts:
+                expert_ids.append(eid)
+
+        if not expert_ids:
+            raise ValueError(f"No mappable experts in: {recommended_strs}")
+
+        # Crop area override: Expert A blocked for large crops regardless
+        if rv.crop_area_px > 150_000 and ExpertID.A in expert_ids:
+            expert_ids.remove(ExpertID.A)
+            if ExpertID.E not in expert_ids:
+                expert_ids.insert(0, ExpertID.E)
+
+        rationale = (
+            f"VLM Router [{rec.get('style','?')} | {rec.get('quality','?')} | "
+            f"diff={difficulty:.2f} | router_conf={router_confidence:.2f}]: "
+            f"{reason}"
+        )
+        logger.info("    ↳ VLM Router → %s (conf=%.2f): %s",
+                     [e.value for e in expert_ids], router_confidence, reason[:60])
+
+        return RoutingDecision(
+            expert_ids=expert_ids,
+            rationale=rationale,
+            probabilities={
+                "router_confidence": router_confidence,
+                "difficulty": difficulty,
+            },
+            metadata=rec,           # store full JSON for ablation/analysis
+        )
+
+    except Exception as e:
+        logger.warning("VLM Router failed (%s). Rule-based fallback.", e)
+        return fallback_fn(rv, available_experts)
+
+
+print("✓ Stage 3 — MoE Router ready (two-tier: rule-based + VLM-guided)")
+
+# %% [markdown]
+# ## 8 · Stage 4 — Expert Pool [P8]–[P14][P17]
+
+# %%
+import time
+import threading
+import tempfile
+from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from PIL import Image
+
+_gpu_lock = threading.Lock()
+
+@contextmanager
+def gpu_context():
+    _gpu_lock.acquire()
+    try:
+        yield
+    finally:
+        _gpu_lock.release()
+
+
+class OCRExpert(ABC):
+    expert_id: ExpertID = ExpertID.TESSERACT
+    _loaded: bool = False
+
+    @abstractmethod
+    def recognize(self, crop: np.ndarray,
+                  bbox: BoundingBox) -> ExpertOutput:
+        ...
+
+    def is_available(self) -> bool:
+        return True
+
+    def load(self) -> None:
+        self._loaded = True
+
+    def unload(self) -> None:
+        self._loaded = False
+
+    @staticmethod
+    def _to_pil(image: np.ndarray) -> Image.Image:
+        if len(image.shape) == 2:
+            return Image.fromarray(cv2.cvtColor(image, cv2.COLOR_GRAY2RGB))
+        return Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+    @staticmethod
+    def _text_to_word_tokens(text: str, expert_id: ExpertID,
+                              confidence: float = 0.0,
+                              base_bbox: Optional[BoundingBox] = None) -> List[WordToken]:
+        words = text.split()
+        return [WordToken(word=w, confidence=confidence,
+                          expert_id=expert_id, bbox=base_bbox)
+                for w in words if w.strip()]
+
+
+print("✓ Expert base class defined")
+
+# %% [markdown]
+# ### Expert A — TrOCR (Handwriting) [P8][P19]
+
+# %%
+
+def segment_lines(binary_image: np.ndarray,
+                   min_line_height: int = 8) -> List[np.ndarray]:
+    inv = (255 - binary_image) if np.mean(binary_image) > 127 else binary_image.copy()
+    proj = np.sum(inv, axis=1).astype(float)
+    if proj.max() < 1:
+        return [binary_image]
+
+    threshold = proj.max() * 0.05
+    is_text = proj > threshold
+    diff = np.diff(is_text.astype(np.int8))
+    starts = list(np.where(diff == 1)[0] + 1)
+    ends   = list(np.where(diff == -1)[0] + 1)
+
+    if is_text[0]:
+        starts.insert(0, 0)
+    if is_text[-1]:
+        ends.append(len(proj))
+    if not starts or not ends:
+        return [binary_image]
+
+    n = min(len(starts), len(ends))
+    starts, ends = starts[:n], ends[:n]
+
+    ms, me = [starts[0]], []
+    for i in range(1, n):
+        if starts[i] - ends[i-1] < 5:
+            continue
+        me.append(ends[i-1])
+        ms.append(starts[i])
+    me.append(ends[-1])
+
+    h = binary_image.shape[0]
+    pad = 3
+    lines = []
+    for s, e in zip(ms, me):
+        crop = binary_image[max(0, s-pad):min(h, e+pad), :]
+        if crop.shape[0] >= min_line_height:
+            lines.append(crop)
+    return lines if lines else [binary_image]
+
+
+class ExpertA_TrOCR(OCRExpert):
+    expert_id = ExpertID.A
+
+    def __init__(self):
+        self._model = None
+        self._processor = None
+
+    def load(self):
+        if self._loaded:
+            return
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+        logger.info("Loading Expert A (TrOCR): %s → %s",
+                     config.TROCR_MODEL, config.DEVICE_LIGHT)
+        self._processor = TrOCRProcessor.from_pretrained(config.TROCR_MODEL)
+        self._model = VisionEncoderDecoderModel.from_pretrained(config.TROCR_MODEL)
+        self._model.eval().to(config.DEVICE_LIGHT)
+        self._loaded = True
+        logger.info("✓ Expert A loaded on %s", config.DEVICE_LIGHT)
+
+    def unload(self):
+        if self._model is not None:
+            self._model.to("cpu")
+            torch.cuda.empty_cache()
+        self._loaded = False
+
+    def recognize(self, crop: np.ndarray, bbox: BoundingBox) -> ExpertOutput:
+        t0 = time.perf_counter()
+        self.load()
+
+        # FIX-NEW-1: TrOCR crop area guard — model was trained on single-line IAM strips
+        crop_area = crop.shape[0] * crop.shape[1]
+        if crop_area > 150_000:
+            logger.info("Expert A: crop too large (%d px²) — returning empty for escalation", crop_area)
+            return ExpertOutput(raw_text="", word_confidence_mean=0.0,
+                                char_confidence_mean=0.0, expert_id=self.expert_id,
+                                inference_time_ms=0.0)
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        line_imgs = segment_lines(binary)
+        logger.info("Expert A: %d line(s) segmented", len(line_imgs))
+
+        texts = []
+        confidences = []
+        for line_img in line_imgs:
+            pil = self._to_pil(line_img)
+            pixel_values = self._processor(
+                images=pil, return_tensors="pt"
+            ).pixel_values.to(config.DEVICE_LIGHT)
+
+            with torch.no_grad():
+                out = self._model.generate(
+                    pixel_values, max_new_tokens=256,
+                    output_scores=True, return_dict_in_generate=True,
+                )
+            text = self._processor.batch_decode(
+                out.sequences, skip_special_tokens=True
+            )[0].strip()
+
+            if hasattr(out, 'scores') and out.scores:
+                probs = [torch.softmax(s, dim=-1).max().item() for s in out.scores]
+                conf = float(np.mean(probs)) if probs else 0.5
+            else:
+                conf = 0.5
+
+            if text:
+                texts.append(text)
+                confidences.append(conf)
+
+        full_text = "\n".join(texts)
+        avg_conf = float(np.mean(confidences)) if confidences else 0.0
+        elapsed = (time.perf_counter() - t0) * 1000
+
+        return ExpertOutput(
+            raw_text=full_text,
+            word_tokens=self._text_to_word_tokens(full_text, self.expert_id,
+                                                   avg_conf, bbox),
+            char_confidence_mean=avg_conf,
+            word_confidence_mean=avg_conf,
+            expert_id=self.expert_id,
+            inference_time_ms=elapsed,
+        )
+
+print("✓ Expert A (TrOCR) defined")
+
+# %% [markdown]
+# ### Expert B — PaddleOCR (Printed Text) [P9]
+
+# %%
+
+class ExpertB_PaddleOCR(OCRExpert):
+    expert_id = ExpertID.B
+
+    def __init__(self):
+        self._ocr = None
+        self._use_tesseract = False
+        # FIX 7: _paddle_v3 was read in _run_paddle() before it could ever be
+        # set when _use_tesseract=True was injected externally (e.g. from
+        # ExpertPool or ExpertC fallback). Added default initialisation here
+        # so the attribute always exists regardless of the load() path taken.
+        self._paddle_v3 = False
+
+    def is_available(self) -> bool:
+        try:
+            import paddleocr
+            return True
+        except ImportError:
+            return False
+
+    def load(self):
+        if self._loaded:
+            return
+        try:
+            import paddleocr as _paddleocr_mod
+            from paddleocr import PaddleOCR
+            try:
+                _major = int(_paddleocr_mod.__version__.split(".")[0])
+                self._paddle_v3 = _major >= 3
+            except Exception:
+                self._paddle_v3 = False
+
+            # FIX-1: Enable GPU when CUDA is available for PaddleOCR
+            _use_gpu = torch.cuda.is_available()
+            logger.info("Loading Expert B (PaddleOCR PP-OCRv4, v3_api=%s) on %s …",
+                        self._paddle_v3, "GPU" if _use_gpu else "CPU")
+            _paddle_kwargs = dict(
+                use_angle_cls=True, lang="en",
+                use_gpu=_use_gpu,
+                show_log=False,
+            )
+            if _use_gpu:
+                _paddle_kwargs["gpu_id"] = 0
+            else:
+                _paddle_kwargs["enable_mkldnn"] = True
+                _paddle_kwargs["cpu_threads"] = 4
+            self._ocr = PaddleOCR(**_paddle_kwargs)
+            self._use_tesseract = False
+            logger.info("✓ Expert B loaded (PaddleOCR on %s)", "GPU" if _use_gpu else "CPU")
+        except Exception as e:
+            logger.warning("PaddleOCR failed (%s). Using Tesseract fallback.", e)
+            self._use_tesseract = True
+        self._loaded = True
+
+    @staticmethod
+    def _parse_paddle_line(line) -> tuple:
+        if isinstance(line, (list, tuple)) and len(line) >= 2:
+            bbox_pts = line[0]
+            rec = line[1]
+            if isinstance(rec, (list, tuple)):
+                text = rec[0] if len(rec) > 0 else ""
+                conf = float(rec[1]) if len(rec) > 1 else 0.0
+            else:
+                text = str(rec)
+                conf = 0.0
+            return bbox_pts, text, conf
+
+        bbox_pts = getattr(line, "bbox", [[0, 0], [0, 0], [0, 0], [0, 0]])
+        text = str(getattr(line, "text", ""))
+        conf = float(getattr(line, "score", 0.0))
+        return bbox_pts, text, conf
+
+    def _run_paddle(self, crop: np.ndarray):
+        if self._paddle_v3:
+            raw = list(self._ocr.predict(crop))
+            if not raw:
+                return []
+            page = raw[0]
+
+            if hasattr(page, "rec_texts"):
+                polys  = list(getattr(page, "rec_polys",  []) or [])
+                texts  = list(getattr(page, "rec_texts",  []) or [])
+                scores = list(getattr(page, "rec_scores", []) or [])
+                if texts:
+                    return list(zip(polys, texts, scores))
+
+            if isinstance(page, dict):
+                polys  = page.get("rec_polys",  page.get("dt_boxes", [])) or []
+                texts  = page.get("rec_texts",  page.get("txts",     [])) or []
+                scores = page.get("rec_scores", page.get("scores",   [])) or []
+                if texts:
+                    return list(zip(polys, texts, scores))
+
+            lines = page if isinstance(page, (list, tuple)) else []
+        else:
+            raw = self._ocr.ocr(crop)
+            lines = raw[0] if (raw and raw[0]) else []
+
+        result = []
+        for line in lines:
+            try:
+                bbox_pts, text, conf = self._parse_paddle_line(line)
+                result.append((bbox_pts, text, conf))
+            except Exception:
+                continue
+        return result
+
+    def recognize(self, crop: np.ndarray, bbox: BoundingBox) -> ExpertOutput:
+        t0 = time.perf_counter()
+        self.load()
+
+        if self._use_tesseract:
+            return self._tesseract_fallback(crop, bbox, t0)
+
+        try:
+            lines = self._run_paddle(crop)
+        except Exception as e:
+            logger.warning("PaddleOCR inference failed (%s). Tesseract fallback.", e)
+            return self._tesseract_fallback(crop, bbox, t0)
+
+        texts = []
+        word_tokens = []
+        confidences = []
+
+        for line_bbox_pts, text, conf in lines:
+            if text.strip():
+                texts.append(text.strip())
+                confidences.append(conf)
+                xs = [p[0] for p in line_bbox_pts]
+                ys = [p[1] for p in line_bbox_pts]
+                word_bb = BoundingBox(
+                    x=bbox.x + int(min(xs)),
+                    y=bbox.y + int(min(ys)),
+                    w=int(max(xs) - min(xs)),
+                    h=int(max(ys) - min(ys)),
+                )
+                for w_tok in text.strip().split():
+                    word_tokens.append(WordToken(
+                        word=w_tok, bbox=word_bb,
+                        confidence=conf, expert_id=self.expert_id,
+                    ))
+
+        full_text = " ".join(texts)
+        avg_conf = float(np.mean(confidences)) if confidences else 0.0
+        elapsed = (time.perf_counter() - t0) * 1000
+
+        return ExpertOutput(
+            raw_text=full_text,
+            word_tokens=word_tokens,
+            char_confidence_mean=avg_conf,
+            word_confidence_mean=avg_conf,
+            expert_id=self.expert_id,
+            inference_time_ms=elapsed,
+        )
+
+    def _tesseract_fallback(self, crop: np.ndarray,
+                              bbox: BoundingBox, t0: float) -> ExpertOutput:
+        import pytesseract
+        enhanced = enhance_clahe(crop)
+        pil = Image.fromarray(
+            cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB) if len(enhanced.shape) == 2
+            else cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+        )
+        data = pytesseract.image_to_data(pil, config=config.TESSERACT_CONFIG,
+                                          output_type=pytesseract.Output.DICT)
+        texts = []
+        word_tokens = []
+        confidences = []
+        for i, word in enumerate(data["text"]):
+            if word.strip() and int(data["conf"][i]) > 0:
+                conf = int(data["conf"][i]) / 100.0
+                texts.append(word.strip())
+                confidences.append(conf)
+                word_tokens.append(WordToken(
+                    word=word.strip(),
+                    bbox=BoundingBox(
+                        x=bbox.x + data["left"][i],
+                        y=bbox.y + data["top"][i],
+                        w=data["width"][i], h=data["height"][i],
+                    ),
+                    confidence=conf,
+                    expert_id=ExpertID.TESSERACT,
+                ))
+
+        full_text = " ".join(texts)
+        avg_conf = float(np.mean(confidences)) if confidences else 0.0
+        # FIX-NEW-4: Cap Tesseract confidence so it never beats VLM/TrOCR in fusion
+        avg_conf = min(avg_conf, 0.42)
+        elapsed = (time.perf_counter() - t0) * 1000
+        return ExpertOutput(
+            raw_text=full_text, word_tokens=word_tokens,
+            char_confidence_mean=avg_conf, word_confidence_mean=avg_conf,
+            expert_id=ExpertID.TESSERACT if self._use_tesseract else self.expert_id,
+            inference_time_ms=elapsed,
+        )
+
+print("✓ Expert B (PaddleOCR / Tesseract fallback) defined")
+
+# %% [markdown]
+# ### Expert C — DocTR (Structured Form Fallback) [P10]
+
+# %%
+
+class ExpertC_DocTR(OCRExpert):
+    expert_id = ExpertID.C
+
+    def __init__(self):
+        self._model = None
+
+    def is_available(self) -> bool:
+        try:
+            import doctr  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def load(self):
+        if self._loaded:
+            return
+        try:
+            from doctr.models import ocr_predictor
+            logger.info("Loading Expert C (DocTR) on CPU …")
+            self._model = ocr_predictor(pretrained=True)
+            logger.info("✓ Expert C loaded (DocTR on CPU)")
+        except Exception as e:
+            logger.warning("DocTR load failed (%s). Expert C unavailable.", e)
+            self._model = None
+        self._loaded = True
+
+    def recognize(self, crop: np.ndarray, bbox: BoundingBox) -> ExpertOutput:
+        t0 = time.perf_counter()
+        self.load()
+
+        if self._model is None:
+            # FIX 8: The original code created ExpertB_PaddleOCR(), then set
+            # _use_tesseract=True and _loaded=True without calling load().
+            # With the FIX 7 above (_paddle_v3 now defaults to False in
+            # __init__), this is safe, but we also guard _loaded properly so
+            # the Tesseract path is taken immediately without trying PaddleOCR.
+            expert_b = ExpertB_PaddleOCR()
+            expert_b._use_tesseract = True
+            expert_b._loaded = True
+            return expert_b.recognize(crop, bbox)
+
+        try:
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB) if len(crop.shape) == 3 else \
+                  cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB)
+            result = self._model([rgb])
+        except Exception as e:
+            logger.warning("DocTR inference failed (%s).", e)
+            return ExpertOutput(expert_id=self.expert_id)
+
+        texts = []
+        word_tokens = []
+        confidences = []
+        h_crop, w_crop = crop.shape[:2]
+
+        for page in result.pages:
+            for block in page.blocks:
+                for line in block.lines:
+                    for word in line.words:
+                        texts.append(word.value)
+                        confidences.append(word.confidence)
+                        (x1r, y1r), (x2r, y2r) = word.geometry
+                        word_tokens.append(WordToken(
+                            word=word.value,
+                            bbox=BoundingBox(
+                                x=bbox.x + int(x1r * w_crop),
+                                y=bbox.y + int(y1r * h_crop),
+                                w=int((x2r - x1r) * w_crop),
+                                h=int((y2r - y1r) * h_crop),
+                            ),
+                            confidence=word.confidence,
+                            expert_id=self.expert_id,
+                        ))
+
+        full_text = " ".join(texts)
+        avg_conf = float(np.mean(confidences)) if confidences else 0.0
+        elapsed = (time.perf_counter() - t0) * 1000
+
+        return ExpertOutput(
+            raw_text=full_text, word_tokens=word_tokens,
+            char_confidence_mean=avg_conf, word_confidence_mean=avg_conf,
+            expert_id=self.expert_id, inference_time_ms=elapsed,
+        )
+
+print("✓ Expert C (DocTR) defined")
+
+# %% [markdown]
+# ### Expert D — GOT-OCR 2.0 (Complex / Mixed Content) [P11]
+
+# %%
+
+class ExpertD_GOT_OCR(OCRExpert):
+    expert_id = ExpertID.D
+
+    def __init__(self):
+        self._model = None
+        self._tokenizer = None
+
+    def is_available(self) -> bool:
+        try:
+            from transformers import AutoModel, AutoTokenizer  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def load(self):
+        if self._loaded:
+            return
+        try:
+            from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizer
+            logger.info("Loading Expert D (GOT-OCR 2.0): %s → %s",
+                         config.GOT_OCR_MODEL, config.DEVICE_HEAVY)
+
+            _orig_init = PreTrainedTokenizer.__init__
+            def _patched_init(self, *args, **kwargs):
+                self.mergeable_ranks = {}
+                _orig_init(self, *args, **kwargs)
+            PreTrainedTokenizer.__init__ = _patched_init
+
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    config.GOT_OCR_MODEL, trust_remote_code=True)
+            finally:
+                PreTrainedTokenizer.__init__ = _orig_init
+
+            self._model = AutoModel.from_pretrained(
+                config.GOT_OCR_MODEL, trust_remote_code=True,
+                low_cpu_mem_usage=True,
+                device_map=config.DEVICE_HEAVY,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+            )
+            self._model.eval()
+            self._loaded = True
+            logger.info("✓ Expert D loaded on %s", config.DEVICE_HEAVY)
+        except Exception as e:
+            logger.warning("GOT-OCR 2.0 load failed (%s). Expert D unavailable.", e)
+            self._loaded = True
+            self._model = None
+
+    def unload(self):
+        if self._model is not None and not config.CO_RESIDENT:
+            self._model.to("cpu")
+            torch.cuda.empty_cache()
+        self._loaded = False
+
+    def recognize(self, crop: np.ndarray, bbox: BoundingBox,
+                  ocr_type: str = "ocr") -> ExpertOutput:
+        """FIX-NEW-11: Added ocr_type parameter for TABLE format mode."""
+        t0 = time.perf_counter()
+        self.load()
+
+        if self._model is None:
+            return ExpertOutput(expert_id=self.expert_id,
+                                raw_text="[Expert D unavailable]")
+
+        # FIX-12: Use /dev/shm (RAM-backed) instead of disk for temp file I/O.
+        # Falls back to regular temp if /dev/shm is unavailable.
+        import uuid as _uuid
+        _shm_dir = "/dev/shm" if os.path.isdir("/dev/shm") else None
+        if _shm_dir:
+            tmp_path = f"/dev/shm/got_ocr_{_uuid.uuid4().hex[:8]}.png"
+        else:
+            _tf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp_path = _tf.name
+            _tf.close()
+
+        pil = self._to_pil(crop)
+        pil.save(tmp_path)
+
+        try:
+            with torch.no_grad():
+                # FIX-NEW-11: Pass ocr_type through (default "ocr", tables use "format")
+                text = self._model.chat(self._tokenizer, tmp_path, ocr_type=ocr_type)
+            text = text.strip() if isinstance(text, str) else str(text).strip()
+        except Exception as e:
+            logger.warning("GOT-OCR inference failed (%s).", e)
+            text = ""
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        # FIX-NEW-8: Confidence for GOT-OCR 2.0 — remove short-word penalty
+        # Short clinical tokens (Tab., 500mg, BD) are NOT garbage
+        words = text.split()
+        n_words = len(words)
+        if n_words == 0:
+            conf = 0.0
+        else:
+            import re as _re_d
+            _garbage_ratio = sum(
+                1 for w in words
+                if _re_d.fullmatch(r'[^a-zA-Z0-9./\-+%]{2,}', w)
+            ) / n_words
+            conf = 0.20 if _garbage_ratio > 0.40 else 0.72
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        return ExpertOutput(
+            raw_text=text,
+            word_tokens=self._text_to_word_tokens(text, self.expert_id, conf, bbox),
+            char_confidence_mean=conf,
+            word_confidence_mean=conf,
+            expert_id=self.expert_id,
+            inference_time_ms=elapsed,
+        )
+
+print("✓ Expert D (GOT-OCR 2.0) defined")
+
+# %% [markdown]
+# ### Expert E — Qwen2-VL (Premium Fallback) [P13]
+
+# %%
+
+class ExpertE_QwenVL(OCRExpert):
+    expert_id = ExpertID.E
+
+    def __init__(self):
+        self._model = None
+        self._processor = None
+
+    def load(self):
+        if self._loaded:
+            return
+        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+        from transformers import BitsAndBytesConfig
+
+        logger.info("Loading Expert E (Qwen2-VL): %s → %s (4-bit)",
+                     config.QWEN_VL_MODEL, config.DEVICE_HEAVY)
+        self._processor = AutoProcessor.from_pretrained(config.QWEN_VL_MODEL)
+        qconfig = BitsAndBytesConfig(load_in_4bit=True)
+        self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+            config.QWEN_VL_MODEL,
+            device_map=config.DEVICE_HEAVY,
+            quantization_config=qconfig,
+        )
+        self._model.eval()
+        self._loaded = True
+        logger.info("✓ Expert E loaded (4-bit on %s)", config.DEVICE_HEAVY)
+
+    def unload(self):
+        if self._model is not None and not config.CO_RESIDENT:
+            import gc
+            del self._model
+            del self._processor
+            self._model = None
+            self._processor = None
+            gc.collect()
+            torch.cuda.empty_cache()
+        self._loaded = False
+
+    def recognize(self, crop: np.ndarray, bbox: BoundingBox) -> ExpertOutput:
+        t0 = time.perf_counter()
+        self.load()
+
+        h, w = crop.shape[:2]
+
+        # FIX-NEW-12: Visual element pre-filter — reject logos, seals, page numbers
+        _crop_area = h * w
+        _aspect = max(h, w) / (min(h, w) + 1)
+        if _aspect < 1.5 and _crop_area < 90_000:
+            _gray_chk = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+            _ink = float(np.sum(_gray_chk < 200)) / _gray_chk.size
+            if _ink < 0.12:
+                logger.info("Expert E: visual element detected (sq=%.1f, ink=%.1f%%) → skip",
+                            _aspect, 100 * _ink)
+                return ExpertOutput(raw_text="", expert_id=self.expert_id,
+                                    word_confidence_mean=0.0, char_confidence_mean=0.0,
+                                    inference_time_ms=0.0)
+
+        # FIX-NEW-12: Raise the absolute minimum gate from 100px to 150px
+        max_edge = max(h, w)
+        if max_edge < 150:
+            logger.info("    ↳ Expert E: region too small (%dx%d) — falling back to Expert B", w, h)
+            fb = ExpertB_PaddleOCR()
+            fb.load()
+            return fb.recognize(crop, bbox)
+
+        if max_edge > 1024:
+            scale = 1024 / max_edge
+            crop = cv2.resize(crop, (int(w * scale), int(h * scale)),
+                              interpolation=cv2.INTER_AREA)
+        # FIX-13: Only upscale genuinely tiny images (<200px), not <512px
+        elif max_edge < 200:
+            scale = 200 / max_edge
+            crop = cv2.resize(crop, (int(w * scale), int(h * scale)),
+                              interpolation=cv2.INTER_CUBIC)
+
+        pil = self._to_pil(crop)
+        # FIX-NEW-2: Clinical handwriting domain prompt
+        prompt = (
+            "This is a scanned crop from an Indian hospital medical record. "
+            "The handwriting is cursive English by medical staff. "
+            "Common content: patient vitals, medication orders (Tab./Inj./Syp. + drug name + dose), "
+            "clinical observations, nurse notes, and doctor signatures. "
+            "YOUR TASK: Read and transcribe ALL handwritten text visible in this image. "
+            "Preserve line breaks. Preserve abbreviations exactly as written. "
+            "If you see a two-column layout (notes left, orders right), "
+            "transcribe left column first, then right column separated by ' | ORDERS: '. "
+            "CRITICAL: If the image contains ONLY blank lines, grid lines, or no readable text, "
+            "you MUST output exactly the word EMPTY_REGION and nothing else. "
+            "Do NOT hallucinate markdown tables. Do NOT output '| | |'. "
+            "Do NOT repeat this prompt. "
+            "Output ONLY the transcribed text."
+        )
+        messages = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": prompt}
+        ]}]
+        text_prompt = self._processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = self._processor(
+            text=[text_prompt], images=[pil],
+            return_tensors="pt", padding=True,
+        ).to(self._model.device)
+
+        from transformers import GenerationConfig
+        _gen_cfg = GenerationConfig(
+            max_new_tokens=2048,
+            do_sample=False,
+            repetition_penalty=1.1,
+        )
+        with torch.no_grad():
+            out = self._model.generate(**inputs, generation_config=_gen_cfg)
+        generated = out[0][inputs["input_ids"].shape[1]:]
+        text = self._processor.decode(generated, skip_special_tokens=True).strip()
+
+        import re as _re
+        text = _re.sub(r'<ref>[^<]*</ref>', '', text)
+        text = _re.sub(r'<box>[^<]*</box>', '', text)
+        text = _re.sub(
+            r'\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)'
+            r'\s*,?\s*'
+            r'\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)',
+            '', text)
+            
+        # Strip Regurgitated Prompt / Hallucinations
+        if "EMPTY_REGION" in text or "patient vitals" in text.lower():
+            text = ""
+            
+        # Strip hallucinated empty table pipes (e.g. "| | | |" or "---|---|")
+        text = _re.sub(r'(?:\|\s*){2,}\|?', ' ', text)
+        text = _re.sub(r'\|?-{3,}\|?', ' ', text)
+        
+        text = _re.sub(r'\s{2,}', ' ', text).strip()
+        
+        # If it's just punctuation left, clear it
+        if text and not _re.search(r'[A-Za-z0-9]', text):
+            text = ""
+
+        # FIX-NEW-2: Hallucination detection for clinical handwriting
+        if not text.strip():
+            conf = 0.0
+        elif _re.search(r'\[INST\]|<\|im_start\|>|<\|im_end\|>', text):
+            conf = 0.1   # raw template tokens leaked
+        elif _re.search(r'\(\d{1,4},\d{1,4}\).*\(\d{1,4},\d{1,4}\)', text):
+            conf = 0.1   # spatial coordinate output
+        elif len(text.strip()) < 5 and h * w > 50_000:
+            conf = 0.05  # near-empty on large crop
+        else:
+            conf = 0.80  # clinical handwriting is dense — don't penalise word count
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        return ExpertOutput(
+            raw_text=text,
+            word_tokens=self._text_to_word_tokens(text, self.expert_id, conf, bbox),
+            char_confidence_mean=conf,
+            word_confidence_mean=conf,
+            expert_id=self.expert_id,
+            inference_time_ms=elapsed,
+        )
+
+print("✓ Expert E (Qwen2-VL) defined")
+
+# %% [markdown]
+# ### Expert G — Donut (OCR-Free Templated Forms) [P17]
+
+# %%
+
+class ExpertG_Donut(OCRExpert):
+    expert_id = ExpertID.G
+
+    def __init__(self):
+        self._model = None
+        self._processor = None
+
+    # FIX-8: Auto-detect task prompt token from tokenizer special tokens.
+    def load(self):
+        if self._loaded:
+            return
+        self._task_prompt = None
+        try:
+            from transformers import DonutProcessor, VisionEncoderDecoderModel
+            logger.info("Loading Expert G (Donut): %s → %s",
+                         config.DONUT_MODEL, config.DEVICE_LIGHT)
+            self._processor = DonutProcessor.from_pretrained(config.DONUT_MODEL)
+            self._model = VisionEncoderDecoderModel.from_pretrained(config.DONUT_MODEL)
+            self._model.config.tie_word_embeddings = False
+            self._model.decoder.config.tie_word_embeddings = False
+            self._model.eval().to(config.DEVICE_LIGHT)
+
+            # Auto-detect the correct task token from special tokens
+            _special = self._processor.tokenizer.all_special_tokens
+            _task_candidates = [t for t in _special
+                                if t.startswith("<s_") and t != "<s>"]
+            if _task_candidates:
+                self._task_prompt = _task_candidates[0]
+                logger.info("✓ Expert G: auto-detected task token: %s", self._task_prompt)
+            else:
+                logger.warning("Expert G: no <s_*> task token found in special tokens %s. "
+                               "Expert G marked unavailable.", _special[:10])
+                self._model = None
+
+            self._loaded = True
+            if self._model is not None:
+                logger.info("✓ Expert G loaded on %s", config.DEVICE_LIGHT)
+        except Exception as e:
+            logger.warning("Donut load failed (%s). Expert G unavailable.", e)
+            self._model = None
+            self._loaded = True
+
+    def recognize(self, crop: np.ndarray, bbox: BoundingBox) -> ExpertOutput:
+        t0 = time.perf_counter()
+        self.load()
+
+        if self._model is None or self._task_prompt is None:
+            return ExpertOutput(expert_id=self.expert_id,
+                                raw_text="[Expert G unavailable]")
+
+        pil = self._to_pil(crop)
+        task_prompt = self._task_prompt
+        decoder_input_ids = self._processor.tokenizer(
+            task_prompt, add_special_tokens=False,
+            return_tensors="pt").input_ids.to(config.DEVICE_LIGHT)
+
+        pixel_values = self._processor(pil, return_tensors="pt").pixel_values
+        pixel_values = pixel_values.to(config.DEVICE_LIGHT)
+
+        from transformers import GenerationConfig
+        _gen_cfg = GenerationConfig(
+            max_length=self._model.decoder.config.max_position_embeddings,
+            pad_token_id=self._processor.tokenizer.pad_token_id,
+            eos_token_id=self._processor.tokenizer.eos_token_id,
+            bad_words_ids=[[self._processor.tokenizer.unk_token_id]],
+            do_sample=False,
+        )
+        with torch.no_grad():
+            out = self._model.generate(
+                pixel_values,
+                decoder_input_ids=decoder_input_ids,
+                generation_config=_gen_cfg,
+                return_dict_in_generate=True,
+            )
+
+        text = self._processor.batch_decode(out.sequences)[0]
+        # FIX-8: Plain text extraction instead of CORD JSON parsing.
+        # Strip task prompt, EOS, and any remaining special tokens.
+        import re as _re_g
+        text = text.replace(task_prompt, "").replace("</s>", "")
+        # Remove any remaining XML-like tags from structured output
+        text = _re_g.sub(r'<[^>]+>', ' ', text)
+        # Collapse whitespace
+        clean_text = _re_g.sub(r'\s+', ' ', text).strip()
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        return ExpertOutput(
+            raw_text=clean_text,
+            word_tokens=self._text_to_word_tokens(clean_text, self.expert_id,
+                                                   0.6, bbox),
+            char_confidence_mean=0.6,
+            word_confidence_mean=0.6,
+            expert_id=self.expert_id,
+            inference_time_ms=elapsed,
+        )
+
+print("✓ Expert G (Donut) defined")
+
+# %% [markdown]
+# ### Expert Pool Manager & Confidence Fusion
+
+# %%
+
+class ExpertPool:
+    def __init__(self):
+        self.experts: Dict[ExpertID, OCRExpert] = {}
+        self._init_experts()
+
+    def _init_experts(self):
+        all_experts = [
+            ExpertA_TrOCR(),
+            ExpertB_PaddleOCR(),
+            ExpertC_DocTR(),
+            ExpertD_GOT_OCR(),
+            ExpertE_QwenVL(),
+            ExpertG_Donut(),
+        ]
+        for expert in all_experts:
+            self.experts[expert.expert_id] = expert
+            logger.info("Registered Expert %s (%s)",
+                         expert.expert_id.value, expert.__class__.__name__)
+
+    @property
+    def available_experts(self) -> set:
+        return set(self.experts.keys()) | {ExpertID.TESSERACT}
+
+    def run_expert(self, expert_id: ExpertID,
+                    crop: np.ndarray,
+                    bbox: BoundingBox) -> ExpertOutput:
+        if expert_id == ExpertID.TESSERACT:
+            fb = ExpertB_PaddleOCR()
+            fb._use_tesseract = True
+            fb._loaded = True
+            return fb.recognize(crop, bbox)
+
+        expert = self.experts.get(expert_id)
+        if expert is None:
+            logger.warning("Expert %s not registered. Tesseract fallback.", expert_id)
+            return self.run_expert(ExpertID.TESSERACT, crop, bbox)
+
+        try:
+            return expert.recognize(crop, bbox)
+        except Exception as e:
+            logger.error("Expert %s failed (%s). Tesseract fallback.", expert_id, e)
+            return self.run_expert(ExpertID.TESSERACT, crop, bbox)
+
+    def run_multi_expert(self, expert_ids: List[ExpertID],
+                          crop: np.ndarray,
+                          bbox: BoundingBox) -> ExpertOutput:
+        """
+        FIX-NEW-5: Priority-tier expert selection.
+        Premium experts (E, D) beat B/Tesseract when they produce non-empty
+        output with conf > 0.25. zip_longest positional fusion removed.
+        """
+        if not expert_ids:
+            return ExpertOutput(raw_text="[VISUAL — no OCR]", expert_id=ExpertID.TESSERACT)
+        if len(expert_ids) == 1:
+            return self.run_expert(expert_ids[0], crop, bbox)
+
+        outputs = []
+        for eid in expert_ids:
+            out = self.run_expert(eid, crop, bbox)
+            if out.raw_text.strip() and not out.raw_text.startswith("[Expert"):
+                outputs.append(out)
+
+        if not outputs:
+            return ExpertOutput(expert_id=expert_ids[0])
+        if len(outputs) == 1:
+            return outputs[0]
+
+        PRIORITY = {ExpertID.E: 4, ExpertID.D: 3, ExpertID.A: 2,
+                    ExpertID.G: 1, ExpertID.C: 1, ExpertID.B: 1, ExpertID.TESSERACT: 0}
+
+        valid = [o for o in outputs
+                 if o.word_confidence_mean > 0.20 and len(o.raw_text.strip()) > 3]
+        if not valid:
+            return max(outputs, key=lambda o: len(o.raw_text))
+
+        premium = [o for o in valid
+                   if PRIORITY.get(o.expert_id, 0) >= 3 and o.word_confidence_mean >= 0.25]
+
+        if premium:
+            best = max(premium, key=lambda o: o.word_confidence_mean)
+        else:
+            best = max(valid, key=lambda o: (PRIORITY.get(o.expert_id, 0),
+                                              o.word_confidence_mean))
+
+        best.inference_time_ms = sum(o.inference_time_ms for o in outputs)
+        return best
+
+    def run_probe(self, crop: np.ndarray,
+                   bbox: BoundingBox) -> ExpertOutput:
+        result = self.run_expert(ExpertID.B, crop, bbox)
+        # FIX-NEW-4: Cap Tesseract probe confidence
+        if result.expert_id == ExpertID.TESSERACT:
+            result.word_confidence_mean = min(result.word_confidence_mean, 0.42)
+            result.char_confidence_mean = min(result.char_confidence_mean, 0.42)
+        return result
+
+    def run_expert_typed(self, expert_id: ExpertID, crop: np.ndarray,
+                          bbox: BoundingBox,
+                          region_class: RegionClass = RegionClass.PRINTED_TEXT) -> ExpertOutput:
+        """FIX-NEW-11: Route TABLE regions to GOT-OCR format mode."""
+        if expert_id == ExpertID.D:
+            expert = self.experts.get(ExpertID.D)
+            if expert is not None and isinstance(expert, ExpertD_GOT_OCR):
+                ocr_type = "format" if region_class == RegionClass.TABLE else "ocr"
+                try:
+                    return expert.recognize(crop, bbox, ocr_type=ocr_type)
+                except Exception as e:
+                    logger.warning("Expert D typed failed (%s). Fallback.", e)
+        return self.run_expert(expert_id, crop, bbox)
+
+    def preload_all(self):
+        if not config.CO_RESIDENT:
+            logger.info("Not co-resident mode — experts load on demand.")
+            return
+        logger.info("Pre-loading all experts (co-resident dual T4) …")
+        for eid, expert in self.experts.items():
+            try:
+                expert.load()
+            except Exception as e:
+                logger.warning("Failed to pre-load Expert %s: %s", eid, e)
+        logger.info("✓ Expert pre-loading complete")
+
+
+expert_pool = ExpertPool()
+print(f"✓ Expert Pool ready ({len(expert_pool.experts)} experts registered)")
+
+# %% [markdown]
+# ## 9 · Stage 5 — Post-OCR Correction & Provenance Assembly [P23][P24]
+
+# %%
+
+COMMON_DRUG_PREFIXES = {
+    "tab", "cap", "inj", "syp", "oint", "susp", "sol", "liq",
+    "amp", "vial", "drp", "neb", "inh",
+}
+
+COMMON_UNITS = {
+    "mg", "ml", "mcg", "iu", "gm", "kg", "cc", "units",
+    "od", "bd", "tds", "qid", "hs", "prn", "sos", "stat",
+    "ac", "pc", "po", "iv", "im", "sc", "sl",
+}
+
+
+def flag_low_confidence_tokens(word_tokens: List[WordToken],
+                                 threshold: float = 0.40) -> List[WordToken]:
+    for wt in word_tokens:
+        if wt.confidence < threshold:
+            wt.error_probability = max(wt.error_probability,
+                                        1.0 - wt.confidence)
+    return word_tokens
+
+
+def apply_medical_heuristics(word_tokens: List[WordToken]) -> List[WordToken]:
+    for wt in word_tokens:
+        lower = wt.word.lower().rstrip(".,;:")
+        if lower in COMMON_DRUG_PREFIXES or lower in COMMON_UNITS:
+            wt.confidence = min(1.0, wt.confidence + 0.15)
+            wt.error_probability = max(0.0, wt.error_probability - 0.15)
+        if len(wt.word) <= 2 and wt.confidence < 0.5:
+            wt.error_probability = max(wt.error_probability, 0.5)
+    return word_tokens
+
+
+def assemble_provenance(
+    region: RegionResult,
+    expert_output: ExpertOutput,
+    routing_decision: RoutingDecision,
+    routing_vector: RoutingVector,
+    doc_id: str,
+    page_no: int,
+) -> RegionResult:
+    tokens = flag_low_confidence_tokens(expert_output.word_tokens)
+    tokens = apply_medical_heuristics(tokens)
+
+    region.text = expert_output.raw_text
+    region.word_tokens = tokens
+    region.expert_id = expert_output.expert_id
+    region.routing_vector = routing_vector
+    region.routing_decision = routing_decision
+    region.inference_time_ms = expert_output.inference_time_ms
+    region.metadata["doc_id"] = doc_id
+    region.metadata["page_no"] = page_no
+    region.metadata["char_conf_mean"] = round(expert_output.char_confidence_mean, 3)
+    region.metadata["word_conf_mean"] = round(expert_output.word_confidence_mean, 3)
+
+    return region
+
+
+print("✓ Stage 5 — Post-OCR Correction & Provenance ready")
+
+# %% [markdown]
+# ## 10 · Pipeline Orchestrator
+
+# %%
+
+class MoEOCRPipeline:
+    """Full 6-stage MoE OCR Pipeline for clinical documents."""
+
+    def __init__(self, layout: LayoutDetector, pool: ExpertPool):
+        self.layout = layout
+        self.pool = pool
+
+    def process_document(self, file_path: str,
+                          force_expert: Optional[ExpertID] = None,
+                          preload: bool = True) -> DocumentExtractionResult:
+        start = time.perf_counter()
+        doc_id = uuid.uuid4().hex[:12]
+        filename = Path(file_path).name
+        logger.info("═" * 60)
+        logger.info("  Processing: %s (doc_id=%s)", filename, doc_id)
+        logger.info("═" * 60)
+
+        if preload and config.CO_RESIDENT:
+            self.pool.preload_all()
+
+        images = ingest_document(file_path)
+        logger.info("Ingested %d page(s)", len(images))
+
+        pages = []
+        for page_idx, page_image in enumerate(images, start=1):
+            page_result = self._process_page(page_image, page_idx, doc_id, force_expert)
+            pages.append(page_result)
+
+        elapsed = time.perf_counter() - start
+        result = DocumentExtractionResult(
+            document_id=doc_id,
+            source_doc_id=doc_id,
+            filename=filename,
+            total_pages=len(pages),
+            pages=pages,
+            processing_time_seconds=round(elapsed, 3),
+        )
+        logger.info("═" * 60)
+        logger.info("  DONE: %s — %.2fs (%d pages)", filename, elapsed, len(pages))
+        logger.info("═" * 60)
+        return result
+
+    def _process_page(self, page_image: np.ndarray, page_no: int,
+                       doc_id: str,
+                       force_expert: Optional[ExpertID]) -> PageExtractionResult:
+        h, w = page_image.shape[:2]
+        logger.info("─── Page %d (%d×%d) ───", page_no, w, h)
+
+        # Stage 0
+        preprocessed, page_quality_var, page_quality_tier = preprocess_page(page_image)
+
+        # Stage 1
+        regions = self.layout.detect(page_image, preprocessed)
+        class_counts: Dict[str, int] = {}
+        for r in regions:
+            class_counts[r.region_class.value] = class_counts.get(r.region_class.value, 0) + 1
+        logger.info("Stage 1: %d regions — %s", len(regions), class_counts)
+
+        all_classes = [r.region_class for r in regions]
+
+        routing_log: List[RoutingLogEntry] = []
+        all_word_tokens: List[WordToken] = []
+        processed_regions: List[RegionResult] = []  # FIX-NEW-6: all regions with text
+
+        page_h, page_w = page_image.shape[:2]
+        page_area = page_h * page_w
+
+        for seq_id, region in enumerate(regions):
+            crop = page_image[region.bbox.y_min:region.bbox.y_max,
+                              region.bbox.x_min:region.bbox.x_max]
+            if crop.size == 0:
+                continue
+
+            # Blank Region Guard
+            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+            ink_density = float(np.sum(gray_crop < 200)) / max(gray_crop.size, 1)
+            if ink_density < 0.01:
+                logger.info("  Region %d: blank region (ink=%.1f%%) — skipping",
+                             seq_id, 100 * ink_density)
+                continue
+
+            # FIX-5: Only call detect_and_correct_rotation() when criteria are met:
+            # - Non-standard aspect ratio (h > 1.5*w OR w > 3*h for text regions)
+            # - OR probe confidence extremely low (<0.20) AND ink > 5%
+            # - OR handwriting with HW score > 0.80
+            crop_h, crop_w = crop.shape[:2]
+            _hw_score = region.metadata.get("handwriting_score", 0.0)
+            _needs_rotation_check = (
+                (crop_h > 1.5 * crop_w) or (crop_w > 3 * crop_h) or
+                (_hw_score > 0.80)
+                # probe_confidence check deferred since probe hasn't run yet
+            )
+            if _needs_rotation_check and ink_density > 0.05:
+                crop, angle = detect_and_correct_rotation(crop)
+                if angle:
+                    region.metadata["rotation_corrected"] = angle
+            else:
+                angle = 0
+
+            # FIX-NEW-9: Always run Stage 2 probe first — eliminates "Quality: ?" in display
+            probe = self.pool.run_probe(crop, region.bbox)
+            probe_conf = probe.word_confidence_mean
+            probe_text = probe.raw_text
+
+            # FIX-NEW-9: Deferred rotation check on low-confidence probe
+            if not _needs_rotation_check and probe_conf < 0.20 and ink_density > 0.05:
+                crop, angle = detect_and_correct_rotation(crop)
+                if angle:
+                    region.metadata["rotation_corrected"] = angle
+                    probe = self.pool.run_probe(crop, region.bbox)
+                    probe_conf = probe.word_confidence_mean
+                    probe_text = probe.raw_text
+
+            routing_vector = compute_routing_vector(
+                region_crop=crop, region=region,
+                page_quality_tier=page_quality_tier,
+                page_region_classes=all_classes,
+                probe_text=probe_text,
+                probe_confidence=probe_conf,
+            )
+
+            # FIX-3: Full-page region guard — replace hardcoded Expert E with
+            # grid_aware_split() and normal routing flow.
+            region_area = (region.bbox.x_max - region.bbox.x_min) * \
+                          (region.bbox.y_max - region.bbox.y_min)
+            if region_area > 0.60 * page_area:
+                gray_crop = (cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                             if len(crop.shape) == 3 else crop)
+                ink_density = float(np.sum(gray_crop < 200)) / gray_crop.size
+                if ink_density < 0.02:
+                    logger.info(
+                        "  Region %d: full-page region appears BLANK "
+                        "(ink=%.1f%%) — skipping OCR",
+                        seq_id, 100 * ink_density)
+                    _dec_blank = RoutingDecision(expert_ids=[], rationale="Blank page — no OCR")
+                    _out_blank = ExpertOutput(
+                        raw_text="", expert_id=ExpertID.B,
+                        char_confidence_mean=0.0, word_confidence_mean=0.0)
+                    region = assemble_provenance(
+                        region, _out_blank, _dec_blank, routing_vector, doc_id, page_no)
+                    processed_regions.append(region)  # FIX-NEW-6
+                    routing_log.append(RoutingLogEntry(
+                        region_id=region.region_id,
+                        routing_vector=routing_vector,
+                        experts_invoked=[],
+                        fusion_method="none",
+                        total_time_ms=0.0,
+                        router_type="rule_based",
+                        crop_area_px=routing_vector.crop_area_px,
+                    ))
+                    continue
+
+                # FIX-3: Always try grid_aware_split() on full-page regions
+                # with ink_density > 0.02 — but skip if already split by detect()
+                _already_split = region.metadata.get("detection_method") == "grid_aware_split"
+                if not _already_split and ink_density > 0.02:
+                    # FIX-NEW-3: Two-column form detection for progress notes / doctor orders
+                    _region_w_frac = (region.bbox.x_max - region.bbox.x_min) / page_w
+                    _region_h_frac = (region.bbox.y_max - region.bbox.y_min) / page_h
+                    sub_regions = None
+                    if _region_w_frac > 0.50 and _region_h_frac > 0.40:
+                        two_col = split_two_column_form(page_image, region)
+                        if len(two_col) == 2:
+                            sub_regions = two_col
+                            logger.info("    ↳ FIX-NEW-3: Two-column split applied, skipping grid split")
+
+                    if sub_regions is None:
+                        sub_regions = grid_aware_split(page_image, region)
+
+                    # FIX-10: Minimum sub-region count check for multi-section docs.
+                    # Only apply forced-thirds split for HANDWRITING or mixed (HW > 0.4).
+                    _is_hw_or_mixed = (
+                        region.region_class == RegionClass.HANDWRITING or
+                        region.metadata.get("handwriting_score", 0.0) > 0.4
+                    )
+                    if len(sub_regions) < 3 and _is_hw_or_mixed:
+                        # Check if page has > 5 horizontal lines
+                        _gray_page = cv2.cvtColor(page_image, cv2.COLOR_BGR2GRAY) \
+                            if len(page_image.shape) == 3 else page_image
+                        _edges = cv2.Canny(_gray_page, 50, 150, apertureSize=3)
+                        _lines = cv2.HoughLinesP(_edges, 1, np.pi / 180,
+                                                  threshold=100,
+                                                  minLineLength=page_w // 6,
+                                                  maxLineGap=20)
+                        _h_count = 0
+                        if _lines is not None:
+                            _h_count = sum(1 for l in _lines
+                                           for x1, y1, x2, y2 in [l[0]]
+                                           if abs(y1 - y2) < 5)
+                        if _h_count > 5:
+                            logger.info("    ↳ FIX-10: Forcing 3 row-based splits "
+                                        "(%d h-lines, %d sub-regions, HW/mixed)",
+                                        _h_count, len(sub_regions))
+                            _ph, _pw = page_image.shape[:2]
+                            _third = _ph // 3
+                            sub_regions = []
+                            for _i in range(3):
+                                _y1 = _i * _third
+                                _y2 = (_i + 1) * _third if _i < 2 else _ph
+                                sub_regions.append(RegionResult(
+                                    region_class=region.region_class,
+                                    detection_confidence=region.detection_confidence * 0.85,
+                                    bbox=BoundingBox(x=0, y=_y1, w=_pw, h=_y2 - _y1),
+                                    metadata={"detection_method": "forced_thirds_split"},
+                                ))
+
+                    if len(sub_regions) > 1:
+                        logger.info("    ↳ FIX-3: Full-page split into %d sub-regions → "
+                                    "routing each through Stage 2→3",
+                                    len(sub_regions))
+                        # Process each sub-region through normal routing
+                        for sub_seq, sub_region in enumerate(sub_regions):
+                            sub_crop = page_image[
+                                sub_region.bbox.y_min:sub_region.bbox.y_max,
+                                sub_region.bbox.x_min:sub_region.bbox.x_max]
+                            if sub_crop.size == 0:
+                                continue
+                            _sub_gray = cv2.cvtColor(sub_crop, cv2.COLOR_BGR2GRAY) \
+                                if len(sub_crop.shape) == 3 else sub_crop
+                            _sub_ink = float(np.sum(_sub_gray < 200)) / max(_sub_gray.size, 1)
+                            if _sub_ink < 0.01:
+                                continue
+
+                            sub_probe = self.pool.run_probe(sub_crop, sub_region.bbox)
+                            sub_rv = compute_routing_vector(
+                                region_crop=sub_crop, region=sub_region,
+                                page_quality_tier=page_quality_tier,
+                                page_region_classes=all_classes,
+                                probe_text=sub_probe.raw_text,
+                                probe_confidence=sub_probe.word_confidence_mean,
+                            )
+                            if force_expert is not None:
+                                sub_dec = RoutingDecision(
+                                    expert_ids=[force_expert],
+                                    rationale=f"Forced: {force_expert.value}")
+                                _sub_router_type = "forced"
+                            elif _fast_route_is_certain(sub_rv):
+                                sub_dec = route_region_fast(sub_rv, self.pool.available_experts)
+                                _sub_router_type = "rule_based"
+                            else:
+                                sub_dec = route_region_vlm(
+                                    sub_crop, sub_rv,
+                                    expert_e=self.pool.experts[ExpertID.E],
+                                    available_experts=self.pool.available_experts,
+                                    fallback_fn=route_region_fast,
+                                )
+                                _sub_router_type = "vlm" if sub_dec.metadata else "rule_based"
+
+                            logger.info("    Sub-region %d.%d [%s %s]: → %s",
+                                         seq_id, sub_seq,
+                                         sub_region.region_class.value,
+                                         sub_rv.quality_tier.value,
+                                         [e.value for e in sub_dec.expert_ids])
+
+                            if not sub_dec.expert_ids:
+                                sub_out = ExpertOutput(raw_text="[VISUAL ELEMENT]",
+                                                       expert_id=ExpertID.TESSERACT)
+                            elif (len(sub_dec.expert_ids) == 1
+                                  and sub_dec.expert_ids[0] == ExpertID.B
+                                  and sub_probe.raw_text.strip()):
+                                sub_out = sub_probe
+                                # FIX-11: Override expert_id when reusing probe
+                                sub_out.expert_id = ExpertID.B
+                            else:
+                                sub_out = self.pool.run_multi_expert(
+                                    sub_dec.expert_ids, sub_crop, sub_region.bbox)
+
+                            sub_region = assemble_provenance(
+                                sub_region, sub_out, sub_dec, sub_rv, doc_id, page_no)
+                            processed_regions.append(sub_region)  # FIX-NEW-6
+                            all_word_tokens.extend(sub_region.word_tokens)
+                            routing_log.append(RoutingLogEntry(
+                                region_id=sub_region.region_id,
+                                routing_vector=sub_rv,
+                                experts_invoked=sub_dec.expert_ids,
+                                fusion_method="single" if len(sub_dec.expert_ids) <= 1
+                                    else "priority_tier",
+                                total_time_ms=sub_out.inference_time_ms,
+                                router_type=_sub_router_type,
+                                crop_area_px=sub_rv.crop_area_px,
+                            ))
+                        continue  # skip normal processing for this region
+
+                # FIX-3: Single-region fallback — split failed or already split
+                # HANDWRITING → Expert A + D (not E). PRINTED_TEXT → Expert B + D (not E).
+                if region.region_class == RegionClass.HANDWRITING:
+                    _fp_experts = [ExpertID.A, ExpertID.D]
+                    _fp_rationale = "Full-page HANDWRITING → Expert A + D [FIX-3]"
+                else:
+                    _fp_experts = [ExpertID.B, ExpertID.D]
+                    _fp_rationale = "Full-page PRINTED_TEXT → Expert B + D [FIX-3]"
+
+                logger.info("  Region %d: full-page %s (%.0f%% of page) → %s",
+                             seq_id, region.region_class.value,
+                             100 * region_area / page_area,
+                             [e.value for e in _fp_experts])
+                expert_output = self.pool.run_multi_expert(
+                    _fp_experts, crop, region.bbox)
+                decision = RoutingDecision(
+                    expert_ids=_fp_experts, rationale=_fp_rationale)
+                region = assemble_provenance(
+                    region, expert_output, decision, routing_vector, doc_id, page_no)
+                processed_regions.append(region)  # FIX-NEW-6
+                all_word_tokens.extend(region.word_tokens)
+                routing_log.append(RoutingLogEntry(
+                    region_id=region.region_id,
+                    routing_vector=routing_vector,
+                    experts_invoked=decision.expert_ids,
+                    fusion_method="priority_tier",
+                    total_time_ms=expert_output.inference_time_ms,
+                    router_type="rule_based",
+                    crop_area_px=routing_vector.crop_area_px,
+                ))
+                continue
+
+            # Stage 3 — Two-tier routing [FIX-NEW-13]
+            if force_expert is not None:
+                decision = RoutingDecision(
+                    expert_ids=[force_expert],
+                    rationale=f"Forced expert override: {force_expert.value}",
+                )
+                _router_type = "forced"
+            elif _fast_route_is_certain(routing_vector):
+                decision = route_region_fast(routing_vector, self.pool.available_experts)
+                _router_type = "rule_based"
+            else:
+                decision = route_region_vlm(
+                    crop, routing_vector,
+                    expert_e=self.pool.experts[ExpertID.E],
+                    available_experts=self.pool.available_experts,
+                    fallback_fn=route_region_fast,
+                )
+                _router_type = "vlm" if decision.metadata else "rule_based"
+
+            logger.info("  Region %d [%s %s]: → %s (%s)",
+                         seq_id, region.region_class.value,
+                         routing_vector.quality_tier.value,
+                         [e.value for e in decision.expert_ids],
+                         decision.rationale[:60])
+
+            # Stage 4
+            if not decision.expert_ids:
+                expert_output = ExpertOutput(
+                    raw_text="[VISUAL ELEMENT]",
+                    expert_id=ExpertID.TESSERACT,
+                )
+            elif (len(decision.expert_ids) == 1
+                  and decision.expert_ids[0] == ExpertID.B):
+                if probe.raw_text.strip():
+                    expert_output = probe
+                    # FIX-11: Override expert_id to B when reusing probe,
+                    # preserving transparency via metadata flags.
+                    expert_output.expert_id = ExpertID.B
+                    region.metadata["probe_reused"] = True
+                    region.metadata["actual_engine"] = (
+                        "tesseract_fallback" if getattr(
+                            self.pool.experts.get(ExpertID.B), '_use_tesseract', False)
+                        else "paddleocr")
+                    logger.info("    ↳ Reusing Expert B probe (%.0fms)",
+                                 probe.inference_time_ms)
+                else:
+                    logger.info("    ↳ Expert B probe empty — escalating to Expert C")
+                    expert_output = self.pool.run_multi_expert(
+                        [ExpertID.C], crop, region.bbox)
+            else:
+                # FIX-NEW-11: Use run_expert_typed for TABLE regions
+                if (routing_vector.region_class == RegionClass.TABLE
+                        and ExpertID.D in decision.expert_ids):
+                    expert_output = self.pool.run_expert_typed(
+                        ExpertID.D, crop, region.bbox,
+                        region_class=RegionClass.TABLE)
+                else:
+                    expert_output = self.pool.run_multi_expert(
+                        decision.expert_ids, crop, region.bbox)
+
+            # Stage 5
+            region = assemble_provenance(
+                region, expert_output, decision, routing_vector, doc_id, page_no)
+            processed_regions.append(region)  # FIX-NEW-6
+            all_word_tokens.extend(region.word_tokens)
+
+            routing_log.append(RoutingLogEntry(
+                region_id=region.region_id,
+                routing_vector=routing_vector,
+                experts_invoked=decision.expert_ids,
+                fusion_method="single" if len(decision.expert_ids) <= 1 else "priority_tier",
+                total_time_ms=expert_output.inference_time_ms,
+                router_type=_router_type,
+                crop_area_px=routing_vector.crop_area_px,
+            ))
+
+        # Quality Report
+        n_hw    = sum(1 for r in processed_regions if r.region_class == RegionClass.HANDWRITING)
+        n_pr    = sum(1 for r in processed_regions if r.region_class == RegionClass.PRINTED_TEXT)
+        n_total = max(len(processed_regions), 1)
+        n_low_conf = sum(1 for wt in all_word_tokens if wt.confidence < 0.5)
+
+        quality_report = QualityReport(
+            page_quality_tier=page_quality_tier,
+            page_laplacian_variance=page_quality_var,
+            pct_handwritten=round(n_hw / n_total, 2),
+            pct_printed=round(n_pr / n_total, 2),
+            pct_low_confidence=round(n_low_conf / max(len(all_word_tokens), 1), 2),
+            total_regions=n_total,
+        )
+
+        # FIX-NEW-6: Build page_text from processed_regions in reading order
+        def _reading_order_key(r: RegionResult) -> tuple:
+            return (r.bbox.y_min // 50, r.bbox.x_min)
+
+        page_text = "\n".join(
+            r.text for r in sorted(processed_regions, key=_reading_order_key)
+            if r.text.strip() and not r.text.startswith("[VISUAL")
+        )
+
+        return PageExtractionResult(
+            page_number=page_no, width=w, height=h,
+            page_text=page_text,
+            word_tokens=all_word_tokens,
+            region_map=processed_regions,          # FIX-NEW-6: not raw `regions`
+            routing_log=routing_log,
+            quality_report=quality_report,
+        )
+
+
+pipeline = MoEOCRPipeline(layout=layout_detector, pool=expert_pool)
+print("✓ Pipeline orchestrator ready")
+
+# %% [markdown]
+# ## 11 · Visualization
+
+# %%
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+
+def visualize_layout(image: np.ndarray, regions: List[RegionResult],
+                      page_num: int = 1) -> None:
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    colors = {
+        "HANDWRITING":    "#FF4444",
+        "PRINTED_TEXT":   "#4488FF",
+        "TABLE":          "#44CC44",
+        "FIGURE":         "#FF8800",
+        "FORM_FIELD":     "#AA44FF",
+        "STAMP":          "#FFAA00",
+        "SIGNATURE":      "#FF44AA",
+        "VISUAL_ELEMENT": "#888888",
+    }
+
+    fig, ax = plt.subplots(1, figsize=(12, 14))
+    ax.imshow(img_rgb)
+
+    for r in regions:
+        bb = r.bbox
+        color = colors.get(r.region_class.value, "#CCCCCC")
+        rect = patches.Rectangle(
+            (bb.x, bb.y), bb.w, bb.h,
+            linewidth=2, edgecolor=color, facecolor="none")
+        ax.add_patch(rect)
+
+        expert = r.expert_id.value if r.expert_id else "?"
+        label = f"{r.region_class.value} → Expert {expert} ({r.detection_confidence:.2f})"
+        ax.text(bb.x, max(0, bb.y - 5), label, color="white", fontsize=8,
+                bbox=dict(facecolor=color, alpha=0.85, edgecolor="none", pad=1))
+
+    plt.axis("off")
+    plt.title(f"Page {page_num} — Layout + Expert Routing", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_quality(result: DocumentExtractionResult) -> None:
+    for page in result.pages:
+        qr = page.quality_report
+        if not qr:
+            continue
+        print(f"\n{'─' * 50}")
+        print(f"  Page {page.page_number} Quality Report")
+        print(f"{'─' * 50}")
+        print(f"  Quality tier     : {qr.page_quality_tier.value} (var={qr.page_laplacian_variance:.0f})")
+        print(f"  Regions          : {qr.total_regions}")
+        print(f"  % Handwritten    : {qr.pct_handwritten:.0%}")
+        print(f"  % Printed        : {qr.pct_printed:.0%}")
+        print(f"  % Low confidence : {qr.pct_low_confidence:.0%}")
+
+        expert_counts: Dict[str, int] = {}
+        for entry in page.routing_log:
+            for eid in entry.experts_invoked:
+                expert_counts[eid.value] = expert_counts.get(eid.value, 0) + 1
+        print(f"  Expert usage     : {expert_counts}")
+
+        # FIX-NEW-13: Router type distribution for ablation
+        router_counts: Dict[str, int] = {}
+        for entry in page.routing_log:
+            router_counts[entry.router_type] = router_counts.get(entry.router_type, 0) + 1
+        print(f"  Router types     : {router_counts}")
+
+        if page.routing_log:
+            avg_k = sum(len(e.experts_invoked) for e in page.routing_log) / len(page.routing_log)
+            print(f"  Avg experts/region: {avg_k:.2f}")
+
+
+def display_results(result: DocumentExtractionResult) -> None:
+    print(f"\n{'═' * 60}")
+    print(f"  RESULTS: {result.filename}")
+    print(f"  Doc ID: {result.document_id}")
+    print(f"  Pages: {result.total_pages}  |  Time: {result.processing_time_seconds}s")
+    print(f"{'═' * 60}")
+
+    for page in result.pages:
+        print(f"\n── Page {page.page_number} ({page.width}×{page.height}) ──")
+        # Build a routing log lookup for router_type and crop_area
+        _log_by_id = {e.region_id: e for e in page.routing_log}
+        for r in page.region_map:
+            expert  = r.expert_id.value
+            conf    = r.metadata.get("word_conf_mean", 0)
+            quality = r.routing_vector.quality_tier.value if r.routing_vector else "?"
+            text_preview = (r.text or "")[:80].replace("\n", " ")
+            # FIX-NEW-13: Show router_type and crop_area in display
+            _log_entry = _log_by_id.get(r.region_id)
+            _rtype = _log_entry.router_type if _log_entry else "?"
+            _crop_px = _log_entry.crop_area_px if _log_entry else 0
+            print(f"  [{r.region_class.value}] Expert {expert} | "
+                  f"Quality: {quality} | Conf: {conf:.2f} | "
+                  f"Router: {_rtype} | Crop: {_crop_px:,} px²")
+            if text_preview:
+                print(f"    → {text_preview}")
+            if r.routing_decision:
+                print(f"    ℹ {r.routing_decision.rationale[:70]}")
+
+
+def get_plain_text(result: DocumentExtractionResult) -> str:
+    page_texts = []
+    for page in result.pages:
+        if page.page_text.strip():
+            page_texts.append(page.page_text)
+    return "\n\n".join(page_texts)
+
+
+def export_provenance_json(result: DocumentExtractionResult,
+                            output_path: str) -> None:
+    import json
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result.model_dump(), f, indent=2, ensure_ascii=False)
+    print(f"✓ Provenance manifest saved: {output_path}")
+
+
+print("✓ Visualization and export functions ready")
+
+# %% [markdown]
+# ## 12 · Run Pipeline
+
+# %%
+FILE_PATH = "/kaggle/input/your-dataset/your-document.png"
+
+if not os.path.exists(FILE_PATH):
+    print("⚠ File not found. Creating synthetic test image …")
+    from PIL import ImageDraw, ImageFont
+    test_img = Image.new("RGB", (800, 400), "white")
+    draw = ImageDraw.Draw(test_img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+    except OSError:
+        font = ImageFont.load_default()
+    draw.text((50, 50),  "Patient Name: Rajesh Kumar",              fill="black", font=font)
+    draw.text((50, 100), "Age: 45 years  Sex: Male",                fill="black", font=font)
+    draw.text((50, 150), "Diagnosis: Type 2 Diabetes Mellitus",     fill="black", font=font)
+    draw.text((50, 200), "Rx: Tab Metformin 500mg BD",              fill="black", font=font)
+    draw.text((50, 250), "Tab Glimepiride 2mg OD before breakfast", fill="black", font=font)
+    draw.text((50, 300), "Inj Insulin Glargine 10 units HS",        fill="black", font=font)
+    FILE_PATH = "/kaggle/working/test_clinical_doc.png"
+    test_img.save(FILE_PATH)
+    print(f"✓ Saved test image: {FILE_PATH}")
+
+print(f"\n📄 Processing: {FILE_PATH}")
+
+# %% [markdown]
+# ### Run the full pipeline
+
+# %%
+result = pipeline.process_document(
+    FILE_PATH,
+    force_expert=None,
+    preload=True,
+)
+
+images = ingest_document(FILE_PATH)
+for i, img in enumerate(images):
+    if i < len(result.pages):
+        visualize_layout(img, result.pages[i].region_map, i + 1)
+
+# %% [markdown]
+# ### Results Display
+
+# %%
+display_results(result)
+visualize_quality(result)
+
+# %% [markdown]
+# ### Plain Text Output
+
+# %%
+plain_text = get_plain_text(result)
+print("═" * 60)
+print("  PLAIN TEXT OUTPUT")
+print("═" * 60)
+print(plain_text)
+
+# %% [markdown]
+# ### Export Provenance JSON
+
+# %%
+export_provenance_json(result, "/kaggle/working/provenance_manifest.json")
+
+with open("/kaggle/working/extracted_text.txt", "w", encoding="utf-8") as f:
+    f.write(plain_text)
+print("✓ Plain text saved: /kaggle/working/extracted_text.txt")
+
+# %% [markdown]
+# ## 13 · Routing Decision Inspector
+
+# %%
+print("═" * 60)
+print("  ROUTING DECISION LOG")
+print("═" * 60)
+for page in result.pages:
+    print(f"\n── Page {page.page_number} ──")
+    for entry in page.routing_log:
+        rv = entry.routing_vector
+        print(f"  Region {entry.region_id}:")
+        print(f"    Class     : {rv.region_class.value}")
+        print(f"    Quality   : {rv.quality_tier.value} (lap={rv.laplacian_variance:.0f})")
+        print(f"    HW score  : {rv.handwriting_score:.2f}")
+        print(f"    Script    : {'INDIAN' if rv.script_flag else 'Latin'}")
+        print(f"    Probe conf: {rv.probe_confidence:.2f}")
+        print(f"    Pred CER  : {rv.predicted_cer:.3f}")
+        print(f"    Complexity: {rv.complexity_score:.2f}")
+        print(f"    → Experts : {[e.value for e in entry.experts_invoked]}")
+        print(f"    → Fusion  : {entry.fusion_method}")
+        print(f"    → Time    : {entry.total_time_ms:.0f}ms")
+
+# %% [markdown]
+# ## 14 · Force Handwriting Expert on All Regions
+
+# %%
+# Uncomment to force handwriting mode:
+# result_hw = pipeline.process_document(FILE_PATH, force_expert=ExpertID.A)
+# display_results(result_hw)
+# print(get_plain_text(result_hw))
+
+# %% [markdown]
+# ## 15 · Batch Processing
+
+# %%
+def batch_process(input_folder: str, output_folder: str,
+                   force_expert: Optional[ExpertID] = None) -> None:
+    import glob, json
+    os.makedirs(output_folder, exist_ok=True)
+
+    files = []
+    for ext in ["*.pdf", "*.png", "*.jpg", "*.jpeg", "*.tiff", "*.bmp"]:
+        files.extend(glob.glob(os.path.join(input_folder, ext)))
+
+    print(f"Found {len(files)} documents in {input_folder}")
+
+    for file_path in files:
+        filename = os.path.basename(file_path)
+        print(f"\nProcessing {filename} …")
+        try:
+            result = pipeline.process_document(file_path, force_expert=force_expert)
+            txt_path = os.path.join(output_folder, f"{filename}.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(get_plain_text(result))
+
+            json_path = os.path.join(output_folder, f"{filename}.json")
+            export_provenance_json(result, json_path)
+
+            print(f"✓ {filename} — {result.processing_time_seconds}s")
+        except Exception as e:
+            print(f"❌ {filename} failed: {e}")
+
+# Uncomment to run batch processing:
+# batch_process("/kaggle/input/your-dataset", "/kaggle/working/batch_output")
+
+# %% [markdown]
+# ## 16 · Ablation Study Runner [P12]
+
+# %%
+def run_ablation(file_path: str) -> Dict[str, Any]:
+    results: Dict[str, Any] = {}
+    images = ingest_document(file_path)
+    if not images:
+        return results
+
+    page_img = images[0]
+    h, w = page_img.shape[:2]
+    bb = BoundingBox(x=0, y=0, w=w, h=h)
+
+    # A0: Raw PaddleOCR on full page
+    t0 = time.perf_counter()
+    a0_out = expert_pool.run_expert(ExpertID.B, page_img, bb)
+    results["A0_single_paddleocr"] = {
+        "text": a0_out.raw_text[:200],
+        "confidence": a0_out.word_confidence_mean,
+        "time_ms": (time.perf_counter() - t0) * 1000,
+    }
+
+    # A1: Preprocessed + PaddleOCR
+    preprocessed, _, _ = preprocess_page(page_img)
+    t0 = time.perf_counter()
+    prep_3ch = cv2.cvtColor(preprocessed, cv2.COLOR_GRAY2BGR)
+    a1_out = expert_pool.run_expert(ExpertID.B, prep_3ch, bb)
+    results["A1_preprocessed"] = {
+        "text": a1_out.raw_text[:200],
+        "confidence": a1_out.word_confidence_mean,
+        "time_ms": (time.perf_counter() - t0) * 1000,
+    }
+
+    # A4: Full pipeline
+    t0 = time.perf_counter()
+    full_result = pipeline.process_document(file_path)
+    results["A4_full_pipeline"] = {
+        "text": get_plain_text(full_result)[:200],
+        "time_ms": full_result.processing_time_seconds * 1000,
+        "experts_used": {
+            e.value: sum(1 for p in full_result.pages
+                         for log in p.routing_log
+                         if e in log.experts_invoked)
+            for e in ExpertID
+        },
+    }
+
+    print("\n═══ Ablation Study Results ═══")
+    for name, data in results.items():
+        print(f"\n{name}:")
+        print(f"  Time: {data.get('time_ms', 0):.0f}ms")
+        print(f"  Confidence: {data.get('confidence', 'N/A')}")
+        print(f"  Text preview: {data.get('text', '')[:100]}")
+
+    return results
+
+# Uncomment to run ablation:
+# ablation = run_ablation(FILE_PATH)
